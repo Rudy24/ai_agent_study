@@ -1,0 +1,43 @@
+# 本地大模型目录（bge-*、reranker 等，体积大勿提交）
+/models/
+
+# 评测结果输出目录
+/hr_eval_results/
+
+# Node 依赖（根目录与前端）
+node_modules/
+frontend/node_modules/
+
+# Python
+.venv_py310_backup/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 环境变量（含密钥，勿提交；可保留 .env.example）
+.env
+.env.local
+.env.*.local
+
+# IDE / 系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+faiss_index/
+
+
+models/bge-small-zh-v1.5/
+models/bge-reranker-base/
+models/bge-reranker-large/
+models/bge-large-zh-v1.5/
+
+uploaded_docs/

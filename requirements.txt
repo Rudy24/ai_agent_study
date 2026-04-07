@@ -1,0 +1,24 @@
+# RAG demo: LangChain + FAISS + local embeddings + DeepSeek API
+# File must stay ASCII-only so pip on Windows (GBK locale) can parse it.
+langchain
+langchain-community
+langchain-text-splitters
+langchain-huggingface
+faiss-cpu
+pypdf
+docx2txt
+python-dotenv
+sentence-transformers
+rank_bm25
+deepseek
+
+# RAG evaluation framework
+ragas
+pandas
+openpyxl
+
+# HTTP API for frontend
+fastapi
+uvicorn[standard]
+sqlalchemy
+pymysql

@@ -1,0 +1,38 @@
+[
+  {
+    "user_input":"普通员工入职需要提交哪些资料？",
+    "retrieved_contexts":[
+
+    ],
+    "response":"",
+    "reference":"普通员工入职需提交：身份证、银行卡、毕业证、职业资格证、与原单位解除或终止劳动合同证明（或无法提供离职证明承诺书）的原件，以及体检报告。",
+    "context_precision":0.0,
+    "context_recall":0.0,
+    "faithfulness":null,
+    "answer_relevancy":null
+  },
+  {
+    "user_input":"管理岗位人员的最终面试由谁确定？",
+    "retrieved_contexts":[
+
+    ],
+    "response":"",
+    "reference":"管理岗位人员任用，由总经理最终面试确定。",
+    "context_precision":0.0,
+    "context_recall":0.0,
+    "faithfulness":null,
+    "answer_relevancy":null
+  },
+  {
+    "user_input":"试用期一般为多久？",
+    "retrieved_contexts":[
+
+    ],
+    "response":"",
+    "reference":"试用期为 1-3 个月。",
+    "context_precision":0.0,
+    "context_recall":0.0,
+    "faithfulness":null,
+    "answer_relevancy":null
+  }
+]
