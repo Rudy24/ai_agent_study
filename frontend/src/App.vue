@@ -67,6 +67,8 @@ async function restoreSessionFromServer() {
       role: row.role === "assistant" ? "assistant" : "user",
       text: String(row.content ?? ""),
       streaming: false,
+      sources:
+        row.role === "assistant" && Array.isArray(row.extra?.sources) ? row.extra.sources : [],
     }));
   } catch {
     localStorage.removeItem(STORAGE_CONV_ID);
@@ -149,6 +151,7 @@ async function consumeSse(res, assistantId) {
           patchAssistant((m) => {
             if (d.result != null) m.text = String(d.result);
             m.streaming = false;
+            if (Array.isArray(d.sources)) m.sources = d.sources;
           });
         } else if (msg.t === "error") {
           throw new Error(String(msg.d || "服务端错误"));
@@ -185,7 +188,7 @@ async function send() {
   error.value = "";
   const assistantId = uid();
   messages.value.push({ id: uid(), role: "user", text: q });
-  messages.value.push({ id: assistantId, role: "assistant", text: "", streaming: true });
+  messages.value.push({ id: assistantId, role: "assistant", text: "", streaming: true, sources: [] });
 
   loading.value = true;
   try {
@@ -282,6 +285,23 @@ watch(
               }}</strong>
             </article>
             <div v-if="m.streaming && m.text" class="streaming-hint">生成中…</div>
+            <div v-if="!m.streaming && m.sources?.length" class="sources">
+              <div class="sources-title">参考来源</div>
+              <ul class="sources-list">
+                <li v-for="(s, idx) in m.sources" :key="idx" class="sources-item">
+                  <a
+                    v-if="s.href"
+                    :href="s.href"
+                    class="source-link"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    >{{ s.label || `摘录${idx + 1}` }}</a
+                  >
+                  <span v-else class="source-chip">{{ s.label || `摘录${idx + 1}` }}</span>
+                  <span class="source-preview" :title="s.preview">{{ s.preview }}</span>
+                </li>
+              </ul>
+            </div>
           </template>
         </div>
       </div>
@@ -436,6 +456,62 @@ watch(
   margin-top: 8px;
   font-size: 0.75rem;
   color: #1677ff;
+}
+
+.sources {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed #e0e4ea;
+}
+
+.sources-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #666;
+  margin-bottom: 6px;
+}
+
+.sources-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sources-item {
+  font-size: 0.8rem;
+  margin-bottom: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.source-link {
+  color: #1677ff;
+  text-decoration: none;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.source-link:hover {
+  text-decoration: underline;
+}
+
+.source-chip {
+  color: #444;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.source-preview {
+  color: #888;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .answer {

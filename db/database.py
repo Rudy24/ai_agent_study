@@ -40,8 +40,11 @@ def _setup_engine() -> None:
 _setup_engine()
 
 
+# ---------- 生命周期：API lifespan 首调；与业务请求中的 SessionLocal 分离 ----------
+
+
 def init_database() -> None:
-    """创建表并写入默认用户（幂等）。"""
+    """创建表并写入默认用户（幂等）；仅在 DATABASE_ENABLED 时执行。"""
     if not DATABASE_ENABLED or engine is None:
         print("[DB] 未配置 DATABASE_URL，跳过 MySQL 初始化")
         return

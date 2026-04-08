@@ -1,6 +1,24 @@
 # HR RAG 系统 — 业务逻辑与架构说明
 
-本文档梳理 `my_rag_system` 的**业务目标**、**模块边界**、**数据如何流动**以及**存储分层**，便于维护与二次开发。
+本文档梳理 `my_rag_system` 的**业务目标**、**模块边界**、**数据如何流动**、**存储分层**，以及**代码阅读顺序与核心分支逻辑**，便于维护、学习与二次开发。
+
+---
+
+## 0. 学习优先级与阅读路线（重点）
+
+下表按「先搞懂主干、再深入细节」排序；标 ★ 为建议精读。
+
+| 优先级 | 文件 / 符号 | 学什么 |
+|--------|-------------|--------|
+| ★★★ | `rag_engine.py` → `RAGEngine.ask` | 一次问答的**完整分支**：离题短路、重排链、压缩链、RetrievalQA、流式回调。 |
+| ★★★ | `rag_engine.py` → `_build_context` / `format_answer_with_reasoning` | **父子块**如何进 Prompt；**推理+最终答案**如何拆分；**concise** 后处理如何约束忠实度。 |
+| ★★ | `knowledge_base.py` → `KnowledgeBase.process_document` | 文档如何切成**父块/子块**、谁写入 FAISS。 |
+| ★★ | `config.py`（前半） | `.env` 如何映射到 `SEARCH_K`、`RERANK_*`、`RAG_LLM_MAX_TOKENS`、`RAG_LOW_LATENCY_MODE` 等。 |
+| ★★ | `api_server.py` → `chat` / `_chat_stream_events` | FastAPI 为何用 **`asyncio.to_thread`** 调同步 `ask`；SSE 如何用**队列+工作线程**把 token 送回协程。 |
+| ★ | `db/chat_store.py`、`db/auth.py` | 会话与消息的落库、`X-API-Key` 如何映射用户。 |
+| ★ | `ragas/*` | 评测如何复用同一套 `config` 与 `RAGEngine`。 |
+
+**推荐阅读顺序**：`main.py`（最短闭环）→ `api_server.py` 的 `_lifespan` + `chat` → `rag_engine.py` 的 `ask` → `knowledge_base.py` 的切块 → `config.py` 的 Prompt 与检索参数。
 
 ---
 
@@ -59,6 +77,85 @@ flowchart TB
 - **向量检索**始终在本地 **FAISS**（目录由 `FAISS_INDEX_PATH` 配置），**不写入 MySQL**。
 - **MySQL**（可选）仅存 **用户、会话、问答消息** 等业务数据；未配置 `DATABASE_URL` 时 API 行为与旧版一致，不落库。
 - **静态制度文档**默认在 `docs/`（`DOCS_DIR`）；索引输出在 `FAISS_INDEX_PATH`。
+
+---
+
+## 2.1 单次问答核心调用链（HTTP → RAG → LLM）
+
+下面描述**生产环境最常见路径**：已配置 `USE_RERANKER=true`、CrossEncoder 加载成功、非流式 `POST /api/chat`。
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant A as api_server
+    participant R as RAGEngine
+    participant V as FAISS 向量检索
+    participant B as BM25
+    participant CE as CrossEncoder
+    participant L as DeepSeek API
+
+    C->>A: POST /api/chat {question}
+    opt DATABASE_ENABLED
+        A->>A: persist_user_question（线程池）
+    end
+    A->>R: asyncio.to_thread(ask, question)
+    R->>R: 离题词表？若命中则直接返回
+    R->>R: _expand_query（轻量同义词扩写）
+    R->>V: similarity_search(k=RERANK_POOL_SIZE)
+    R->>B: get_relevant_documents（k 临时对齐池大小）
+    R->>R: _dedupe_documents 合并去重
+    R->>CE: predict(pairs, batch_size=RERANK_BATCH_SIZE)
+    CE-->>R: 分数排序 → 取前 RERANK_TOP_N
+    R->>R: _build_context（优先 metadata.parent_content）
+    R->>R: optimized_prompt.format(context, question)
+    R->>L: ChatOpenAI.invoke 或 stream
+    L-->>R: 原始生成文本
+    R->>R: format_answer_with_reasoning（concise 后处理等）
+    R-->>A: {result, answer_only, source_documents}
+    opt DATABASE_ENABLED
+        A->>A: persist_assistant_answer（线程池）
+    end
+    A-->>C: JSON（含 sources、conversation_id）
+```
+
+**要点**：
+
+- FastAPI 路由是 **async**，而 `RAGEngine.ask` 内部大量 **同步** 调用（LangChain、sentence-transformers、阻塞式 HTTP），故用 **`asyncio.to_thread`** 把整个 `ask` 丢进线程池，避免卡住事件循环。
+- **流式**路径相同逻辑在 `ask(..., stream_callback=...)` 中；`api_server._chat_stream_events` 用**后台线程**跑 `ask`，通过 **`call_soon_threadsafe` + `asyncio.Queue`** 把 delta 交给主协程写 SSE。
+
+---
+
+## 2.2 `RAGEngine.ask` 分支决策树（逻辑总览）
+
+实现位置：`rag_engine.py` 中 `ask` 方法。下列判断按代码顺序执行。
+
+```mermaid
+flowchart TD
+    Start([ask 开始]) --> OT{RAG_OFF_TOPIC_ENABLED<br/>且命中关键词?}
+    OT -->|是| R1[返回礼貌拒答<br/>不调检索/LLM]
+    OT -->|否| EXP[_expand_query]
+    EXP --> RR{_reranker_ready?<br/>模型路径存在且 USE_RERANKER}
+    RR -->|是| POOL[_retrieve_for_rerank<br/>向量+BM25 合并去重]
+    POOL --> RK[_rerank_documents<br/>CrossEncoder TopN]
+    RK --> ANS1[_answer_from_context_docs<br/>拼 Prompt → LLM → 后处理]
+    RR -->|否| CMP{compression_retriever<br/>已创建?}
+    CMP -->|是| CP[compression_retriever.invoke]
+    CP --> BR{concise / standard<br/>及是否 stream}
+    BR --> ANS2[手写或 qa_chain 生成 + format_answer...]
+    CMP -->|否| QC{qa_chain 非空?}
+    QC -->|是| BR2[stream 则 ensemble 拉文档后手写 LLM<br/>否则 qa_chain.invoke]
+    QC -->|否| FB[防御性 ensemble 截断 TopN]
+    ANS1 --> End([返回 dict])
+    ANS2 --> End
+    BR2 --> End
+    FB --> End
+    R1 --> End
+```
+
+**设计意图简述**：
+
+- **优先 CrossEncoder 路径**：若先走「上下文压缩检索」，会对每条候选再调 LLM 摘录，成本高且与精排目标重叠，故在 `USE_RERANKER=true` 时**不走**压缩器作为主路径。
+- **`qa_chain`**：在未启用重排、且 CrossEncoder 未就绪时的兜底链式调用；**流式**时不能直接用 `RetrievalQA.invoke`（不暴露 token 流），故改为 **ensemble 取文档 + `_llm_generate(..., stream_callback)`**。
 
 ---
 
@@ -167,9 +264,12 @@ flowchart TB
 
 - **路径类**：`DOCS_DIR`、`FAISS_INDEX_PATH`、`SEED_DOCUMENT_PATH` / `DEFAULT_SEED_DOCUMENT` 等。
 - **模型与检索**：`EMBEDDING_*`、`SEARCH_K`、`RERANK_*`、`USE_RERANKER`、`RAG_PROMPT_STYLE` 等。
+- **延迟相关（重点）**：`RAG_LOW_LATENCY_MODE`（一键收紧池大小、passage 长度、TopN、`max_tokens`）、`RAG_LLM_MAX_TOKENS`（主链路 LLM 输出上限）、`RERANK_BATCH_SIZE` / `RERANK_POOL_SIZE` / `RERANK_MAX_PASSAGE_CHARS`。
 - **API**：`API_HOST`、`API_PORT`、`API_CORS_ORIGINS`。
 - **生产持久化**：`DATABASE_URL`、`DEFAULT_APP_USER`、`API_SERVICE_API_KEY`、`API_REQUIRE_API_KEY`。
 - **Prompt**：`RAG_SYSTEM_TYPE` 与 `get_current_prompt_template()`（当前 HR 模板在 `config.py`）。
+
+`config.py` 文件内分区大致为：环境变量与线程安全默认值 → 嵌入与 DeepSeek → CrossEncoder 路径 → `_env_bool` / `_env_int` → 检索与重排数值 → 低开销模式与 `RAG_LLM_MAX_TOKENS` → Prompt 风格与离题短路 → RAGAS 相关工厂函数 → API/FAISS 路径等（以源码顺序为准）。
 
 ---
 
@@ -209,7 +309,18 @@ main.py            # CLI
 frontend/          # Vue 3
 ragas/             # 评测脚本与数据
 docs/              # 制度源文档（默认）与本架构说明
+tests/concurrency/ # /api/chat 并发压测脚本（可选）
 ```
+
+---
+
+## 12. 源码中的注释约定（便于学习）
+
+- **模块顶部的长文档字符串**：说明职责、数据流、与本文档章节对应关系。
+- **`# ---------- 区块标题 ----------` 或 `# ========== ... ==========`**：在 `rag_engine.py`、`api_server.py`、`knowledge_base.py`、`db/chat_store.py`、`db/database.py` 等文件中划分逻辑块，方便跳转。
+- **函数 docstring**：说明输入输出、调用时机、与评测（RAGAS）或前端字段的对应关系；核心类方法（如 `RAGEngine.ask`、`_answer_from_context_docs`）补充「在整条链路中的位置」。
+
+修改业务逻辑时，建议同步更新相关 docstring 与本文档 **§2.1 / §2.2**。
 
 ---
 

@@ -4,6 +4,10 @@
 ==================
 供 api_server 在线程中调用：写入用户/助手轮次；列表接口供前端恢复气泡。
 【注意】此处不修改 RAG 行为；历史 content 不会自动拼入 RAGEngine.ask。
+
+【调用关系】
+  - 写：`persist_user_question` →（RAG）→ `persist_assistant_answer`，由 `api_server` 的 `to_thread` 包一层 DB 会话。
+  - 读：`list_conversations` / `list_messages` 供 REST 列表与拉历史。
 """
 import uuid  # 新会话 id
 from datetime import datetime, timezone  # 更新时间戳
@@ -14,6 +18,9 @@ from sqlalchemy.orm import Session  # ORM 会话
 from db.models import Conversation, Message  # 模型
 
 
+# ---------- 写路径：一轮问答对应「用户 Message」+ 可选新建 Conversation ----------
+
+
 def persist_user_question(
     session: Session,
     user_id: int,
@@ -21,8 +28,9 @@ def persist_user_question(
     question: str,
 ) -> str:
     """
-    写入用户问题；无 conversation_id 时新建会话。
-    返回当前会话 id。
+    写入用户问题；无 conversation_id 时新建会话（UUID），title 取首问前 200 字。
+    校验：已有 id 必须属于该 user_id，否则 ValueError（防越权）。
+    返回当前会话 id，供后续 `persist_assistant_answer` 与 API 响应回传前端。
     """
     now = datetime.now(timezone.utc)
     if conversation_id:
@@ -58,7 +66,10 @@ def persist_assistant_answer(
     answer_only: str,
     sources: Optional[List[Dict[str, Any]]],
 ) -> None:
-    """写入助手完整回复与简要元数据。"""
+    """
+    写入助手消息：`content` 存完整展示文本（含推理段）；`extra` 存 answer 摘要、来源条数与最多 10 条 sources。
+    用于前端「参考来源」回放与审计，不参与下次 RAG 检索。
+    """
     now = datetime.now(timezone.utc)
     conv = session.query(Conversation).filter(Conversation.id == conversation_id).first()
     if conv:
@@ -66,6 +77,7 @@ def persist_assistant_answer(
     extra: Dict[str, Any] = {
         "answer_only_preview": (answer_only or "")[:2000],
         "source_count": len(sources or []),
+        "sources": (sources or [])[:10],
     }
     session.add(
         Message(
@@ -76,6 +88,9 @@ def persist_assistant_answer(
         )
     )
     session.commit()
+
+
+# ---------- 读路径：列表与单会话时间序 ----------
 
 
 def list_conversations(session: Session, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:

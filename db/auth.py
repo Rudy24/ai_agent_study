@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
-"""根据 X-API-Key 解析用户 id；未启用数据库时返回 0（不落库）。"""
+"""
+API 鉴权与「虚拟用户 id」
+========================
+FastAPI 依赖 `_get_user_id_dep` 调用 `resolve_user_id`：把请求头 `X-API-Key`（可选）映射到 `rag_users.id`。
+
+【行为摘要】
+  - 未配置 DATABASE_URL：`user_id=0`，api_server 跳过一切 chat_store 写入。
+  - `API_REQUIRE_API_KEY=true`：必须带 Key，且 SHA256 与库中 `api_key_hash` 一致。
+  - 否则：带 Key 则尝试匹配；无 Key 则回落到 `DEFAULT_APP_USER` 对应行（由 init_database 创建）。
+"""
 import hashlib  # 校验 API Key
 from typing import Optional  # 类型
 

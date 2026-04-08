@@ -11,6 +11,9 @@
   检索命中的是「子块」；生成上下文时 `_build_context` 读取 `parent_content` 扩大可见原文。
 
 配置依赖：config.EMBEDDING_*、LOCAL_MODEL_PATH、HF_ENDPOINT、FAISS_INDEX_PATH。
+
+【数据流】磁盘文件 → Loader → 清洗 → 父切分 → 子切分（子带 parent_content）→ FAISS 仅存子块；
+推理时 rag_engine._build_context 优先用 parent_content 拼进 LLM。
 """
 import os
 import re
@@ -65,6 +68,16 @@ def _resolve_embedding_device():
             return "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:
             return "cpu"
+    if EMBEDDING_DEVICE == "cuda":
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+            print("[WARN] EMBEDDING_DEVICE=cuda 但 torch.cuda.is_available()=False，回退 cpu（请安装 CUDA 版 PyTorch 与驱动）")
+            return "cpu"
+        except ImportError:
+            print("[WARN] 未安装 torch，嵌入使用 cpu")
+            return "cpu"
     return EMBEDDING_DEVICE
 
 
@@ -101,9 +114,16 @@ def _clean_documents(documents):
 class KnowledgeBase:
     """
     嵌入模型 + 文档处理 + FAISS 生命周期。
-    典型用法：process_document(单文件) → create_vector_store；或 load_vector_store() 复用磁盘索引。
+
+    【主要方法】
+      - `process_document(path)`：读 PDF/DOCX/TXT → 父子切块 → 返回 Document 列表（尚未写入向量库）。
+      - `create_vector_store(documents)`：嵌入并 `save_local` 到 `FAISS_INDEX_PATH`。
+      - `load_vector_store()`：从磁盘恢复 FAISS + 同一套 Embeddings，供 `RAGEngine` 使用。
+
+    典型用法：首次 `process_document` → `create_vector_store`；之后启动只 `load_vector_store`。
     """
 
+    # ---------- 初始化：解析本地模型路径 + 设备 + HuggingFaceEmbeddings ----------
     def __init__(self):
         # 国内镜像：在创建 HuggingFaceEmbeddings 之前写入 HF_ENDPOINT，以下载/解析模型 ID
         if HF_ENDPOINT:
@@ -132,10 +152,12 @@ class KnowledgeBase:
         )
         print("[INFO] Embedding 模型加载完成")
 
+    # ---------- 建库第一步：单文件 → 子块 Document 列表（尚未写入向量）----------
     def process_document(self, file_path):
         """
-        加载单文件并切分为 Document 列表。
+        加载单文件并切分为 **子块** Document 列表（每个子块 metadata 含父全文）。
         支持：.pdf（PyPDFLoader）、.docx（Docx2txtLoader）、其他扩展名按 UTF-8 文本（TextLoader）。
+        返回的列表直接交给 `create_vector_store` 做嵌入与 FAISS 写入。
         """
         print(f"[INFO] 正在处理文档: {file_path}")
 
@@ -176,6 +198,7 @@ class KnowledgeBase:
         )
         
         parent_docs = parent_splitter.split_documents(documents)
+        abs_source = os.path.abspath(file_path)
 
         # 每个父块再拆成若干子块；子块携带父全文供 rag_engine._build_context 使用
         child_docs = []
@@ -185,15 +208,18 @@ class KnowledgeBase:
                 child.metadata["parent_id"] = i  # 父序号，便于溯源
                 child.metadata["parent_content"] = parent.page_content  # 生成用宽上下文
                 child.metadata["is_parent"] = False
+                child.metadata.setdefault("source", abs_source)
                 child_docs.append(child)
 
         print(f"[OK] 父子索引策略：{len(parent_docs)} 个父文档，{len(child_docs)} 个子文档")
 
         return child_docs
 
+    # ---------- 建库第二步：嵌入 + 落盘（与 load_vector_store 成对）----------
     def create_vector_store(self, texts):
         """
-        用当前 embeddings 将文档块写入 FAISS，并 save_local 到 FAISS_INDEX_PATH。
+        用当前 `self.embeddings` 将文档块写入内存 FAISS，再 `save_local` 到 `FAISS_INDEX_PATH`。
+        `texts` 一般为 `process_document` 返回的子块列表。
         """
         print("[INFO] 正在构建向量索引...")
         vectorstore = FAISS.from_documents(texts, self.embeddings)
@@ -204,7 +230,8 @@ class KnowledgeBase:
 
     def load_vector_store(self):
         """
-        从 FAISS_INDEX_PATH 加载已保存索引。
+        从 `FAISS_INDEX_PATH` 加载已保存索引；须与建库时使用**同一套** Embeddings 模型与维度。
+        `allow_dangerous_deserialization=True` 为 LangChain 加载本地 pickle 类索引所需（自有索引可信）。
         """
         if os.path.exists(FAISS_INDEX_PATH):
             print("[INFO] 正在加载本地索引...")

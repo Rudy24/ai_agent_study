@@ -5,19 +5,26 @@ RAG 引擎模块（rag_engine.py）
         →（可选）LLM 上下文压缩 → 拼 Prompt → DeepSeek 生成 → 推理/最终答案拆分
         → concise 模式下的忠实度相关后处理。
 
+【学习建议】先读 `RAGEngine.ask`（单次问答总入口），再读 `_answer_from_context_docs`、`_build_context`，
+最后读本文件前半段的 `format_answer_with_reasoning` 与各 `clip_/expand_` 函数（concise 后处理）。
+完整分支图见 docs/ARCHITECTURE.md「2.2 RAGEngine.ask 分支决策树」。
+
 【数据流（与 ARCHITECTURE.md 第 4 节对应）】
-  question ──► _expand_query（同义词扩召回）
-       ──► 压缩路径：compression_retriever.invoke（LLM 摘录检索结果）
-       或 重排路径：_retrieve_for_rerank + _rerank_documents（CrossEncoder）
-       或 回退：qa_chain / ensemble 直接检索
+  question ──► 离题短路（可选）→ _expand_query
+       ──► 主路径（USE_RERANKER 且模型就绪）：_retrieve_for_rerank → _rerank_documents → _answer_from_context_docs
+       或 压缩路径：compression_retriever.invoke → 再拼 Prompt + LLM（未开 rerank 时）
+       或 回退：qa_chain.invoke 或 ensemble 取文档 + 手写 _llm_generate（尤其 stream 场景）
        ──► _build_context（父子块：优先 metadata.parent_content）
-       ──► optimized_prompt.format(context, question)  # 见 config 铁律与注入软防护
-       ──► _llm_generate（temperature=0）
+       ──► optimized_prompt.format(context, question)
+       ──► _llm_generate（temperature=0；可选 stream_callback）
        ──► format_answer_with_reasoning → answer_only 供 RAGAS
 
 【记忆】本模块不读取历史消息；多轮仅由 API/DB 存库，单轮 ask 只消费当前 question。
 
-配置依赖：config 中 DeepSeek、SEARCH_K、RERANK_*、RAG_PROMPT_STYLE、get_current_prompt_template。
+配置依赖：config 中 DeepSeek、SEARCH_K、RERANK_*、RAG_PROMPT_STYLE、RAG_LLM_MAX_TOKENS、get_current_prompt_template。
+
+【源码分区】文件中用「# ========== … ==========」标题划分：导入 → 离题短路 → concise 后处理 →
+检索辅助函数 → RAGEngine 类（__init__ / 检索 / LLM / ask）。
 """
 import math  # 重排分数 NaN 时降级为 -inf，避免 sorted 行为不确定
 import os
@@ -26,6 +33,7 @@ from typing import Callable, List, Optional, Tuple
 
 import config as _bootstrap_config  # noqa: F401 — 先于 langchain 加载 KMP/OMP 等，避免 Windows 下 native 崩溃
 
+# ========== 依赖导入：多版本 LangChain 兼容（community / classic / 旧 langchain）==========
 try:
     from langchain_community.chat_models import ChatOpenAI
     from langchain_community.retrievers import BM25Retriever
@@ -63,15 +71,23 @@ except ImportError:
     from langchain.schema import HumanMessage
     from langchain.schema import Document
 
+# 运行期常量：检索宽度、重排、Prompt 风格、离题词表等均来自 config，勿在 rag_engine 写死业务阈值
 from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_MODEL,
+    RAG_LLM_MAX_TOKENS,
+    RAG_OFF_TOPIC_ENABLED,
+    RAG_OFF_TOPIC_KEYWORDS,
+    RAG_OFF_TOPIC_REPLY,
     RAG_PROMPT_STYLE,
     RAG_RELEVANCY_CONTEXT_EXPAND_MARGIN,
     RERANK_BATCH_SIZE,
+    RERANK_MAX_PASSAGE_CHARS,
     RERANK_POOL_SIZE,
     RERANK_TOP_N,
+    RERANK_DEVICE,
+    RERANK_USE_FP16_CUDA,
     RERANKER_MODEL_PATH,
     SEARCH_K,
     USE_RERANKER,
@@ -80,9 +96,75 @@ from config import (
 )
 
 
-# Prompt 模板已移至 config.py 统一管理
-# 支持多种业务场景（HR、客服等），通过 RAG_SYSTEM_TYPE 配置切换
-# 核心逻辑中不再包含业务相关的 Prompt 定义
+# ========== 区块：离题短路（不调检索/LLM，降低无效成本）==========
+# Prompt 模板在 config.py，通过 RAG_SYSTEM_TYPE / get_current_prompt_template 切换业务话术
+
+
+def _query_matches_off_topic(query: str) -> bool:
+    """子串命中 config.RAG_OFF_TOPIC_KEYWORDS 时视为明显非制度问题，走礼貌拒答短路。"""
+    qn = (query or "").strip()
+    if not qn:
+        return False
+    ql = qn.lower()
+    for kw in RAG_OFF_TOPIC_KEYWORDS:
+        k = (kw or "").strip()
+        if not k:
+            continue
+        if k in qn:
+            return True
+        if k.lower() in ql:
+            return True
+    return False
+
+
+def _polite_off_topic_payload() -> dict:
+    """不调检索与 LLM，返回与 ask() 同结构的固定拒答（无引用）。"""
+    reasoning = (
+        "推理：该问题与员工考勤、薪酬、假期等制度无关，或属于外部常识/闲聊；"
+        "本助手仅连接公司已上传的制度文档，无法回答此类内容。\n\n"
+    )
+    final_line = f"最终答案：{RAG_OFF_TOPIC_REPLY}"
+    return {
+        "result": f"{reasoning}{final_line}",
+        "answer_only": RAG_OFF_TOPIC_REPLY,
+        "source_documents": [],
+    }
+
+
+# ========== 区块：CrossEncoder 设备与 passage 截断（重排性能相关）==========
+
+
+def _resolve_rerank_torch_device() -> str:
+    """按 RERANK_DEVICE（auto/cuda/cpu）选择 CrossEncoder 所在设备，不可用时回退 cpu 并打印告警。"""
+    import torch
+    mode = (RERANK_DEVICE or "auto").strip().lower()
+    if mode == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if mode == "cuda":
+        if not torch.cuda.is_available():
+            print("[WARN] RERANK_DEVICE=cuda 但 CUDA 不可用，回退 cpu（请安装 CUDA 版 PyTorch 与 NVIDIA 驱动）")
+            return "cpu"
+        return "cuda"
+    return "cpu"
+
+
+def _passage_text_for_cross_encoder(doc: Document) -> str:
+    """
+    供 CrossEncoder 打分的 passage：截断至 RERANK_MAX_PASSAGE_CHARS，避免长父块拖慢 tokenizer 与推理。
+    子块为空时回退 metadata.parent_content 前缀，与重排语义仍大致一致。
+    """
+    meta = getattr(doc, "metadata", None) or {}
+    t = (getattr(doc, "page_content", None) or "").strip()
+    if not t and isinstance(meta, dict):
+        t = (meta.get("parent_content") or "").strip()
+    lim = RERANK_MAX_PASSAGE_CHARS
+    if lim and len(t) > lim:
+        return t[:lim]
+    return t
+
+
+# ========== 区块：concise 模式答案后处理（faithfulness / answer_relevancy 与 RAGAS 对齐）==========
+# 思路：先规范化空白 → 按上下文剔除杜撰分句 → 多问问句数对齐 → 受控扩窗提高与问题的字面重合
 
 
 def normalize_concise_rag_answer(text: str) -> str:
@@ -94,13 +176,32 @@ def normalize_concise_rag_answer(text: str) -> str:
 
 
 def _merged_raw_doc_text(docs) -> str:
-    """拼接当前检索到的正文，供摘录子串校验（不含 [片段n] 前缀）。"""
+    """
+    拼接当前检索文档的正文，供 concise 子句校验与扩窗（与 _build_context 对齐）。
+    须包含 metadata.parent_content（若存在），否则仅 page_content 时答案常来自父块字面，
+    导致「answer not in context_blob」、扩窗跳过，RAGAS answer_relevancy 易偏低。
+    """
     parts = []
     for d in docs or []:
+        meta = getattr(d, "metadata", None) or {}
+        if isinstance(meta, dict):
+            p = meta.get("parent_content")
+            if isinstance(p, str) and p.strip():
+                parts.append(p.strip())
         c = getattr(d, "page_content", "") or ""
         if c.strip():
             parts.append(c.strip())
     return "\n".join(parts)
+
+
+def document_context_text_for_eval(doc) -> str:
+    """与 _build_context 对齐：RAGAS contexts 优先父块，否则子块 page_content。"""
+    meta = getattr(doc, "metadata", None) or {}
+    if isinstance(meta, dict):
+        p = meta.get("parent_content")
+        if isinstance(p, str) and p.strip():
+            return p.strip()
+    return (getattr(doc, "page_content", None) or "").strip()
 
 
 def clip_concise_clauses_by_context(answer: str, context_blob: str) -> str:
@@ -172,7 +273,11 @@ def expand_single_clause_for_relevancy(answer: str, question: str, context_blob:
 
 
 def apply_concise_answer_postprocess(text: str, question: str, context_blob: str) -> str:
-    """concise 模式：归一化 → 上下文子句过滤 → 多问问句数裁剪 → 各分句分别受控扩窗抬 answer_relevancy。"""
+    """
+    concise 流水线：空白归一 → `clip_concise_clauses_by_context`（剔除上下文无字面的「；」分句）
+    → `trim_redundant_clauses_for_multi_question`（多问时对齐分句数）→ 可选 `expand_*` 扩窗。
+    `context_blob` 须与检索正文一致（含 parent_content），见 `_merged_raw_doc_text`。
+    """
     out = normalize_concise_rag_answer(text)
     out = clip_concise_clauses_by_context(out, context_blob)
     out = trim_redundant_clauses_for_multi_question(out, question)
@@ -228,16 +333,26 @@ def _extract_stream_chunk_text(chunk) -> str:
     return str(c)
 
 
+# ========== 区块：LLM 原始输出 → 展示用 result + 评测用 answer_only ==========
+
+
 def format_answer_with_reasoning(
     raw_llm_text: str, query: str, context_blob: str, concise: bool
 ) -> Tuple[str, str]:
-    """返回 (界面展示字符串, 仅最终答案供 RAGAS)；concise 时仅对最终段做摘录后处理。"""
+    """
+    解析模型输出：先 `split_reasoning_and_final_answer` 拆「推理」与「最终答案」；
+    concise 时只对最终段做 `apply_concise_answer_postprocess`，再 `merge_reasoning_display` 拼回展示形态。
+    返回 (result 用全文, answer_only 仅最终段)；RAGAS 等评测消费第二项，避免推理前缀干扰指标。
+    """
     reasoning, final = split_reasoning_and_final_answer(raw_llm_text)
     body = (final or raw_llm_text or "").strip()
     if concise:
         body = apply_concise_answer_postprocess(body, query, context_blob)
     display = merge_reasoning_display(reasoning, body)
     return display, body
+
+
+# ========== 区块：检索前处理（去重、BM25 文档源、路径检查）==========
 
 
 def _dedupe_documents(docs) -> List:
@@ -283,16 +398,26 @@ def _faiss_documents_for_bm25(vectorstore, k_max: int = 1000) -> List:
     return vectorstore.similarity_search("。", k=min(k_max, max(n, 1)))
 
 
+# ========== 类 RAGEngine：向量+BM25 混合检索、可选重排、Prompt+LLM、流式 ==========
+
+
 class RAGEngine:
-    """混合检索 + 可选 CrossEncoder 重排 + DeepSeek 生成。"""
+    """
+    混合检索 + 可选 CrossEncoder 重排 + DeepSeek 生成。
+    初始化阶段：建 retriever / ensemble /（可选）qa_chain 与 compression_retriever；
+    运行阶段：入口一律为 ask()。
+    """
 
     def __init__(self, vectorstore):
-        self.vectorstore = vectorstore
+        self.vectorstore = vectorstore  # LangChain FAISS 包装，含 embed_query 与 docstore
+        # LLM：temperature=0 降随机性；max_tokens 须顶层传入（LangChain Pydantic 禁止塞 model_kwargs）
         self.llm = ChatOpenAI(
             model=DEEPSEEK_MODEL,
             temperature=0,
             api_key=DEEPSEEK_API_KEY,
             base_url=DEEPSEEK_BASE_URL,
+            n=1,
+            max_tokens=int(RAG_LLM_MAX_TOKENS),
         )
 
         # 限制 BLAS 线程，降低与 PyTorch OpenMP 在 BM25/NumPy 路径上并发导致的 Windows 段错误概率
@@ -311,10 +436,11 @@ class RAGEngine:
         os.environ["OPENBLAS_NUM_THREADS"] = "1"
         print("[DEBUG] RAGEngine 中再次强制设置单线程环境变量")
 
+        # 向量一路：每问一次 embed_query + FAISS 近邻
         self.vector_retriever = self.vectorstore.as_retriever(
             search_kwargs={"k": SEARCH_K}
         )
-        # 使用保护方式创建 BM25，避免直接崩溃
+        # BM25 一路：依赖预先扫 docstore 建稀疏索引（与向量互补，英文/专有名词有时更稳）
         try:
             docs = _faiss_documents_for_bm25(self.vectorstore, k_max=1000)
             self.bm25_retriever = BM25Retriever.from_documents(docs)
@@ -324,13 +450,13 @@ class RAGEngine:
             print(f"[ERROR] BM25Retriever 创建失败: {bm25_err}")
             raise
 
+        # 加权合并两路结果（权重和不必为 1，LangChain 内部会归一）
         self.ensemble_retriever = EnsembleRetriever(
             retrievers=[self.bm25_retriever, self.vector_retriever],
             weights=[0.4, 0.6],
         )
 
-        # 使用配置化的 Prompt 系统，支持多种业务类型（HR、客服等）
-        # 从 config.py 中获取当前系统类型的 Prompt 模板
+        # Prompt：仅两占位符 context / question，与下面手写 format 一致
         prompt_template_text = get_current_prompt_template()
         
         self.optimized_prompt = PromptTemplate(
@@ -339,14 +465,14 @@ class RAGEngine:
         )
         print(f"[INFO] RAG 生成模版: 系统类型={RAG_SYSTEM_TYPE}, Prompt样式={RAG_PROMPT_STYLE}")
 
-        # CrossEncoder reranker 配置
-        # 使用 sentence-transformers 的 CrossEncoder，兼容性更好
+        # 重排就绪则主路径用手写检索+精排，不再用 RetrievalQA 包一层（避免与 rerank 逻辑重复）
         self._cross_encoder = None
         self._reranker_ready = bool(USE_RERANKER and _reranker_path_ok(RERANKER_MODEL_PATH))
 
         if self._reranker_ready:
             self.qa_chain = None
         else:
+            # 无重排时：经典 stuff 链，一次 invoke 完成检索+生成
             self.qa_chain = RetrievalQA.from_chain_type(
                 llm=self.llm,
                 chain_type="stuff",
@@ -355,7 +481,7 @@ class RAGEngine:
                 chain_type_kwargs={"prompt": self.optimized_prompt},
             )
 
-        # 上下文压缩：使用 LLM 提取与问题最相关的内容，减少噪声
+        # 可选第二路：对 ensemble 结果再用 LLM 做摘录（成本高；开 rerank 时 ask 不优先走此路）
         self.compression_retriever = None
         if LLMChainExtractor is not None and ContextualCompressionRetriever is not None:
             try:
@@ -371,9 +497,13 @@ class RAGEngine:
         else:
             print("[INFO] 上下文压缩功能不可用，将使用原始检索器")
 
+    # ---------- RAGEngine / CrossEncoder：懒加载 + 失败则回退 qa_chain ----------
     def _ensure_cross_encoder(self):
-        """加载 CrossEncoder reranker。
-        使用 sentence-transformers 的 CrossEncoder，兼容性更好。"""
+        """
+        懒加载 CrossEncoder（sentence-transformers），供 `_rerank_documents` 与 API 启动预热调用。
+        - 成功：`_cross_encoder` 非空，精排走 GPU/CPU 前向。
+        - 失败：置 `_cross_encoder_load_failed`，并补建 `qa_chain` 与无 rerank 时一致，避免后续 ask 崩。
+        """
         if not self._reranker_ready:
             print("[DEBUG] reranker 未启用，跳过加载")
             return
@@ -387,9 +517,21 @@ class RAGEngine:
             import torch
             from sentence_transformers import CrossEncoder
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"[DEBUG] 使用设备: {device}")
-            self._cross_encoder = CrossEncoder(RERANKER_MODEL_PATH, device=device)
+            device = _resolve_rerank_torch_device()
+            print(f"[INFO] CrossEncoder 使用设备: {device}")
+            model_kwargs = {}
+            if device == "cuda" and RERANK_USE_FP16_CUDA:
+                model_kwargs["torch_dtype"] = torch.float16
+            if model_kwargs:
+                try:
+                    self._cross_encoder = CrossEncoder(
+                        RERANKER_MODEL_PATH, device=device, model_kwargs=model_kwargs
+                    )
+                except Exception as fp16_err:
+                    print(f"[WARN] CrossEncoder FP16 加载失败，回退 FP32: {fp16_err}")
+                    self._cross_encoder = CrossEncoder(RERANKER_MODEL_PATH, device=device)
+            else:
+                self._cross_encoder = CrossEncoder(RERANKER_MODEL_PATH, device=device)
             print(f"[INFO] CrossEncoder reranker loaded: {RERANKER_MODEL_PATH} ({device})")
         except Exception as e:
             self._cross_encoder_load_failed = True
@@ -404,8 +546,12 @@ class RAGEngine:
                 chain_type_kwargs={"prompt": self.optimized_prompt},
             )
 
+    # ---------- RAGEngine / 查询改写：仅关键词表驱动，减轻同义词漏召 ----------
     def _expand_query(self, query: str) -> str:
-        """查询扩展，提高召回。"""
+        """
+        若问题命中预设 HR 词（试用期、年假等），把同义词拼进查询串，供向量与 BM25 共用。
+        不改变用户原始 `query` 在 Prompt【问题】中的展示（精排仍用原始 query 与 passage 配对）。
+        """
         expansions = {
             "试用期": ["试用期", "转正", "试用", " probation period"],
             "年假": ["年假", "年休假", "带薪年假", "annual leave"],
@@ -419,27 +565,41 @@ class RAGEngine:
         return query
 
     def _bm25_invoke(self, q: str):
-        """兼容不同 LangChain 版本 BM25 接口。"""
+        """统一 BM25 调用：LangChain 新版 `invoke` 与旧版 `get_relevant_documents` 二选一。"""
         r = self.bm25_retriever
         if hasattr(r, "invoke"):
             return r.invoke(q)
         return r.get_relevant_documents(q)
 
+    # ---------- RAGEngine / 重排前候选池：向量 + BM25 合并，限制条数防 CE 过慢 ----------
     def _retrieve_for_rerank(self, expanded_query: str) -> List:
-        """向量与 BM25 各拉一批，合并去重，供 CrossEncoder 打分。"""
-        vdocs = self.vectorstore.similarity_search(expanded_query, k=RERANK_POOL_SIZE)
-        bdocs = self._bm25_invoke(expanded_query)
+        """
+        双路各取至多 `RERANK_POOL_SIZE` 条，再 `_dedupe_documents` 合并去重。
+        使用 `expanded_query` 扩大召回；BM25 的 `k` 在此临时调小/对齐，用完 `finally` 恢复，避免污染全局 retriever。
+        """
+        kv = max(1, int(RERANK_POOL_SIZE))
+        vdocs = self.vectorstore.similarity_search(expanded_query, k=kv)
+        r = self.bm25_retriever
+        prev_k = getattr(r, "k", SEARCH_K)
+        try:
+            r.k = min(kv, prev_k) if prev_k else kv
+            bdocs = self._bm25_invoke(expanded_query)
+        finally:
+            r.k = prev_k
         return _dedupe_documents(list(vdocs) + list(bdocs))
 
     def _rerank_documents(self, query: str, docs: List) -> List:
-        """CrossEncoder 对 (query, passage) 打分，降序取前 RERANK_TOP_N。"""
+        """
+        用 **原始问题** `query` 与每条 passage（经 `_passage_text_for_cross_encoder` 截断）组成 pair，批量 `predict`。
+        分数降序取前 `RERANK_TOP_N`；异常或模型未加载时退回「原始顺序截断」，保证 ask 总能返回。
+        """
         self._ensure_cross_encoder()
         if not docs or self._cross_encoder is None:
             print("[DEBUG] CrossEncoder 未加载，使用原始文档顺序")
             return docs[:RERANK_TOP_N] if docs else []
         
         print(f"[DEBUG] 开始 rerank {len(docs)} 个文档")
-        pairs = [[query, d.page_content] for d in docs]
+        pairs = [[query, _passage_text_for_cross_encoder(d) or (d.page_content or "")[:200]] for d in docs]
         
         try:
             scores = self._cross_encoder.predict(
@@ -465,9 +625,13 @@ class RAGEngine:
         scored = sorted(zip(scores, docs), key=lambda t: _rerank_score_key(t[0]), reverse=True)
         return [d for _, d in scored[:RERANK_TOP_N]]
 
+    # ---------- RAGEngine / 拼 Prompt 上下文：与 knowledge_base 父子块约定一致 ----------
     def _build_context(self, docs: List) -> str:
-        """父子索引策略：优先使用父文档内容（语义更完整）。
-        如果子文档有对应的父文档，则使用父文档，否则使用子文档内容。"""
+        """
+        将 Top 文档拼成一大段 `context` 填入模板【上下文】。
+        子块 metadata 若含 `parent_content`（建库时由 KnowledgeBase 写入），则用父块全文，否则用子块 `page_content`。
+        这样检索命中细粒度子块，生成仍能看到更完整段落，减轻断章取义。
+        """
         parts = []
         for i, d in enumerate(docs, 1):
             # 优先使用父文档内容（语义更完整）
@@ -481,16 +645,24 @@ class RAGEngine:
         return "\n\n".join(parts)
 
     def _ensemble_get_documents(self, expanded_query: str) -> List:
-        """与 RetrievalQA 相同检索器拉文档，供流式路径手动拼 prompt。"""
+        """
+        仅拉取 ensemble 文档列表，不调用 LLM；用于流式场景（RetrievalQA 无法边生成边回调 token）。
+        与 `qa_chain` 底层 retriever 一致，保证非流式与流式检索结果同源。
+        """
         er = self.ensemble_retriever
         if hasattr(er, "invoke"):
             return list(er.invoke(expanded_query) or [])
         return list(er.get_relevant_documents(expanded_query) or [])
 
+    # ---------- RAGEngine / LLM：非流式 invoke 与流式 stream 合一出口 ----------
     def _llm_generate(
         self, prompt_text: str, stream_callback: Optional[Callable[[str], None]] = None
     ) -> str:
-        """调用 LLM：无回调时 invoke；有回调时 stream 并拼接完整回复。"""
+        """
+        组装单条 `HumanMessage` 调用 DeepSeek（经 LangChain ChatOpenAI）。
+        - 无 `stream_callback`：同步 `invoke`，适合 `/api/chat` 线程池路径。
+        - 有 `stream_callback`：逐 chunk 解析文本并回调，最后拼接成完整串，供后处理与落库。
+        """
         messages = [HumanMessage(content=prompt_text)]
         if stream_callback is None:
             resp = self.llm.invoke(messages)
@@ -509,28 +681,61 @@ class RAGEngine:
                 stream_callback(piece)
         return "".join(acc)
 
+    def _answer_from_context_docs(
+        self,
+        query: str,
+        docs: List,
+        stream_callback: Optional[Callable[[str], None]] = None,
+    ) -> dict:
+        """
+        **重排路径与兜底路径的汇合点**：已定稿 `docs` → `_build_context` → `optimized_prompt.format` → `_llm_generate`
+        → `format_answer_with_reasoning`（concise 后处理、拆 `answer_only`）。
+        返回 dict 与 `ask` 其它分支一致，便于 API 与评测统一解析。
+        """
+        context = self._build_context(docs)
+        prompt_text = self.optimized_prompt.format(context=context, question=query)
+        raw = self._llm_generate(prompt_text, stream_callback)
+        blob = _merged_raw_doc_text(docs)
+        use_concise = RAG_PROMPT_STYLE == "concise"
+        display, answer_only = format_answer_with_reasoning(raw, query, blob, use_concise)
+        return {"result": display, "answer_only": answer_only, "source_documents": docs}
+
     def ask(self, query, stream_callback: Optional[Callable[[str], None]] = None):
         """
         单次问答入口（无多轮历史注入）。
-        :param query: 当前用户问题（整段进入 Prompt 的【问题】栏）。
+        :param query: 当前用户问题（整段进入 Prompt 的【问题】栏；CrossEncoder 也用它与 passage 配对）。
         :param stream_callback: 非 None 时 LLM 使用 stream，并对每个文本片回调（SSE 用）。
-        :return: dict 含 result（展示全文）、answer_only（最终答案段）、source_documents。
+        :return: dict：`result`（界面展示，可含推理前缀）、`answer_only`（最终句，供 RAGAS）、`source_documents`（引用列表）。
+
+        分支优先级简述：离题短路 →（若启用 rerank）双路召回+CE→`_answer_from_context_docs`；
+        否则若有压缩检索器则走压缩链；否则 `qa_chain` 或 ensemble 手写 LLM；最后防御性兜底。
         """
+        # 以下分支顺序与 docs/ARCHITECTURE.md「2.2 决策树」一致，修改时请同步文档
         print(f"[DEBUG] === ask() 开始执行，query: {query[:50]}... ===")
+
+        if RAG_OFF_TOPIC_ENABLED and _query_matches_off_topic(query):
+            print("[INFO] 命中离题词表，返回礼貌拒答（不调检索/LLM）")
+            payload = _polite_off_topic_payload()
+            if stream_callback:
+                stream_callback(payload["result"])
+            return payload
 
         # 步骤 1：轻量查询扩展，提高 BM25/向量对同义词的召回
         expanded_query = self._expand_query(query)
         print(f"[DEBUG] query 扩展完成: {expanded_query[:50]}...")
 
-        # 步骤 2：若配置启用 reranker，懒加载 CrossEncoder（失败则回退 qa_chain）
+        # 步骤 2：启用 Rerank 时优先 CrossEncoder（不先走压缩检索器，避免每条候选一次 LLM、约 10s+ 且精排不生效）
         if self._reranker_ready:
-            print("[DEBUG] reranker 已启用，准备调用 _ensure_cross_encoder()")
+            print("[DEBUG] reranker 已启用，走 CrossEncoder 精排链路")
             self._ensure_cross_encoder()
-            print("[DEBUG] _ensure_cross_encoder() 调用完成")
-        else:
-            print("[DEBUG] reranker 未启用，使用 qa_chain 路径")
+            merged = self._retrieve_for_rerank(expanded_query)
+            top_docs = self._rerank_documents(query, merged)
+            return self._answer_from_context_docs(query, top_docs, stream_callback)
 
-        # 步骤 3a：优先走「上下文压缩检索器」——用 LLM 对 ensemble 结果做摘录，再进生成（长文本降噪）
+        print("[DEBUG] reranker 未启用")
+
+        # 步骤 3a：无 rerank 时，若初始化了 compression_retriever，则先让 LLM 从 ensemble 结果里「摘录」再生成第二道 LLM
+        # （两次 LLM，成本高；与步骤 2 的 CE 精排互斥为主路径）
         if hasattr(self, 'compression_retriever') and self.compression_retriever is not None:
             print("[DEBUG] 使用上下文压缩检索器")
             compressed_docs = self.compression_retriever.invoke(expanded_query)
@@ -546,10 +751,11 @@ class RAGEngine:
                     "source_documents": compressed_docs,
                 }
             else:
-                # standard + 流式：禁止走 RetrievalQA.invoke（其不暴露 stream），改用手动检索 + _llm_generate
+                # standard：非流式可走 qa_chain；流式必须手写「ensemble 取 docs + format + _llm_generate」
                 if stream_callback is not None:
                     docs = self._ensemble_get_documents(expanded_query)
                     ctx_docs = docs[:RERANK_TOP_N] if docs else []
+                    # context 用全部 ensemble 文档；source_documents 只截 RERANK_TOP_N 与列表展示一致
                     context = self._build_context(docs)
                     prompt_text = self.optimized_prompt.format(context=context, question=query)
                     raw = self._llm_generate(prompt_text, stream_callback)
@@ -572,7 +778,7 @@ class RAGEngine:
                     result["answer_only"] = answer_only
                 return result
 
-        # 步骤 3b：未启用压缩或压缩器不可用 —— 使用 RetrievalQA（无 rerank）或下面 rerank 分支
+        # 步骤 3b：无压缩器（或未进入 3a）且已有 qa_chain：非流式一次 invoke；流式同样手写 ensemble+LLM
         if self.qa_chain is not None:
             if stream_callback is not None:
                 docs = self._ensemble_get_documents(expanded_query)
@@ -602,13 +808,8 @@ class RAGEngine:
                 result["answer_only"] = answer_only
             return result
 
-        # 步骤 3c：启用了 reranker 且 qa_chain 为 None —— 手动合并向量+BM25 后 CrossEncoder 打分
-        merged = self._retrieve_for_rerank(expanded_query)
-        top_docs = self._rerank_documents(query, merged)
-        context = self._build_context(top_docs)
-        prompt_text = self.optimized_prompt.format(context=context, question=query)
-        raw = self._llm_generate(prompt_text, stream_callback)
-        blob = _merged_raw_doc_text(top_docs)
-        use_concise = RAG_PROMPT_STYLE == "concise"
-        display, answer_only = format_answer_with_reasoning(raw, query, blob, use_concise)
-        return {"result": display, "answer_only": answer_only, "source_documents": top_docs}
+        # 步骤 3c：理论上不应到达（未开 Rerank 时 __init__ 已创建 qa_chain）；防御性退回 ensemble 截断
+        print("[WARN] RAG 路径异常：qa_chain 为空，退回 ensemble 检索截断")
+        docs = self._ensemble_get_documents(expanded_query)
+        ctx_docs = docs[:RERANK_TOP_N] if docs else []
+        return self._answer_from_context_docs(query, ctx_docs, stream_callback)

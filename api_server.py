@@ -12,10 +12,18 @@ HR RAG HTTP 服务（FastAPI）
 启动：uvicorn api_server:app --host 0.0.0.0 --port 8000  或  python api_server.py
 
 前端：POST /api/chat 或 /api/chat/stream；SSE 帧为 data: {json}\\n\\n；跨域配 API_CORS_ORIGINS。
+
+【阅读顺序】
+  1) `_lifespan`：启动时 init_database → KnowledgeBase → `_bootstrap_rag_core` → 可选 `_ensure_cross_encoder`
+  2) `chat`：落库用户句 → `to_thread(ask)` → 序列化 sources → 落库助手句
+  3) `_chat_stream_events`：同上但 `ask(..., stream_callback)` + 队列桥接线程与协程
+
+【为何大量 to_thread】RAGEngine.ask 内部为同步阻塞（向量检索、CrossEncoder、HTTP LLM），在 async 路由里必须放到线程池，避免阻塞整个事件循环。
 """
 import asyncio  # 异步队列与线程配合做 SSE
 import json  # SSE 与 JSON 响应序列化
 import os  # 须最先设置线程相关环境变量（与 main 一致）
+from urllib.parse import quote  # 制度文档外链路径编码
 import sys  # 可选：保证 UTF-8 输出
 import threading  # 在后台线程跑同步的 engine.ask，避免阻塞事件循环
 from contextlib import asynccontextmanager  # FastAPI 生命周期里加载向量库
@@ -43,18 +51,21 @@ from fastapi.middleware.cors import CORSMiddleware  # 浏览器跨域
 from fastapi.responses import StreamingResponse  # SSE 流式响应
 from pydantic import BaseModel, Field  # 请求体验证
 
+# ========== 配置导入（热路径仅 FAISS 路径、CORS、DB 开关等；RAG 细节在 rag_engine 读 config）==========
 from config import (  # 统一配置
     API_CORS_ORIGINS,
     API_HOST,
     API_PORT,
     DATABASE_ENABLED,
+    DOCS_PUBLIC_BASE_URL,
     FAISS_INDEX_PATH,
+    USE_RERANKER,
     get_seed_document_path,
 )
 
-# 全局：共享 KnowledgeBase（复用 Embedding）、RAG 引擎
-_kb_shared: Any = None
-_rag_engine: Any = None
+# ========== 进程级单例：由 lifespan 赋值，请求处理阶段只读（无锁；uvicorn 单 worker 假设）==========
+_kb_shared: Any = None  # 嵌入模型与 FAISS 加载入口
+_rag_engine: Any = None  # 每个 HTTP 问答最终调用其 ask()
 
 
 def _get_user_id_dep(x_api_key: Optional[str] = Header(None, alias="X-API-Key")) -> int:
@@ -65,7 +76,10 @@ def _get_user_id_dep(x_api_key: Optional[str] = Header(None, alias="X-API-Key"))
 
 
 def _serialize_sources(docs: Optional[List], max_items: int = 5, preview_len: int = 240) -> List[Dict[str, Any]]:
-    """把 LangChain Document 列表转成可 JSON 序列化的来源列表（供前端展示摘要）。"""
+    """
+    把 `source_documents` 转成 JSON 可序列化列表：preview、label（文件名）、href（配了 DOCS_PUBLIC_BASE_URL 时）。
+    与 `chat_store.persist_assistant_answer` 写入的 extra.sources 结构一致，供前端「参考来源」展示。
+    """
     out: List[Dict[str, Any]] = []
     if not docs:
         return out
@@ -74,7 +88,24 @@ def _serialize_sources(docs: Optional[List], max_items: int = 5, preview_len: in
         one_line = raw.replace("\n", " ").strip()
         preview = one_line[:preview_len] + ("..." if len(one_line) > preview_len else "")
         meta = getattr(d, "metadata", None) or {}
-        out.append({"preview": preview, "metadata": dict(meta) if isinstance(meta, dict) else {}})
+        meta_dict = dict(meta) if isinstance(meta, dict) else {}
+        src_path = meta_dict.get("source") or ""
+        label = os.path.basename(str(src_path)) if src_path else ""
+        if not label:
+            label = "制度摘录"
+        href: Optional[str] = None
+        if DOCS_PUBLIC_BASE_URL and src_path:
+            bn = os.path.basename(str(src_path))
+            if bn:
+                href = f"{DOCS_PUBLIC_BASE_URL}/{quote(bn)}"
+        out.append(
+            {
+                "preview": preview,
+                "label": label,
+                "href": href,
+                "metadata": meta_dict,
+            }
+        )
     return out
 
 
@@ -102,6 +133,9 @@ def _bootstrap_rag_core(kb) -> Any:
     return RAGEngine(vs)
 
 
+# ========== FastAPI 生命周期：唯一构造 RAGEngine 的位置（与 main.py CLI 独立）==========
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """应用启动：MySQL 建表 + 单例 KnowledgeBase + RAGEngine。"""
@@ -112,8 +146,11 @@ async def _lifespan(app: FastAPI):
     init_database()
     _kb_shared = KnowledgeBase()
     _rag_engine = await asyncio.to_thread(_bootstrap_rag_core, _kb_shared)
+    # 启动时预加载 CrossEncoder，避免首个请求额外多秒冷启动（仅 USE_RERANKER=true 时）
+    if USE_RERANKER and _rag_engine is not None:
+        await asyncio.to_thread(_rag_engine._ensure_cross_encoder)
     print("[API] RAG 引擎已就绪")
-    yield
+    yield  # 应用运行中；关闭时清理引用，便于多进程 reload 场景释放句柄
     _rag_engine = None
     _kb_shared = None
 
@@ -202,10 +239,13 @@ async def api_get_messages(conversation_id: str, user_id: int = Depends(_get_use
         raise HTTPException(status_code=404, detail=str(e)) from e
 
 
-# ---------- 问答（核心：调用 RAGEngine，与 DB 解耦）----------
+# ---------- 问答：核心为 _rag_engine.ask；DB 仅审计/前端历史，不参与 Prompt ----------
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, user_id: int = Depends(_get_user_id_dep)):
-    """非流式问答；启用 MySQL 时写入用户问题与助手回答。"""
+    """
+    非流式问答。
+    顺序：鉴权 user_id →（可选）落库用户句 → **线程池** `ask`（CPU/GPU/HTTP 阻塞在此线程）→ 序列化 sources →（可选）落库助手句。
+    """
     if _rag_engine is None:
         raise HTTPException(status_code=503, detail="RAG engine not ready")
     q = req.question.strip()
@@ -257,13 +297,18 @@ async def chat(req: ChatRequest, user_id: int = Depends(_get_user_id_dep)):
     )
 
 
-# ---------- SSE：线程内 ask(stream_callback)，主协程从队列吐帧 ----------
+# ---------- SSE：工作线程跑同步 ask + stream_callback；主协程 await Queue 写 event-stream ----------
 async def _chat_stream_events(
     question: str,
     user_id: int,
     conversation_id_in: Optional[str],
 ) -> AsyncGenerator[str, None]:
-    """流式问答 + 可选落库：首包 meta 携带 conversation_id。"""
+    """
+    流式问答生成器：产出 SSE 字符串帧。
+    线程模型：`worker` 线程跑同步 `ask(stream_callback=on_token)`；`on_token` 用 call_soon_threadsafe 把片段塞进 asyncio.Queue；
+    主协程 `await aq.get()` 再 `yield`，避免在 worker 里直接操作异步上下文。
+    帧类型：meta（conversation_id）→ 多条 delta → 一条 final（完整 result + sources）。
+    """
     if _rag_engine is None:
         yield _sse_data({"t": "error", "d": "RAG engine not ready"})
         return

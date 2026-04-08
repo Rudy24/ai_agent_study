@@ -4,6 +4,9 @@ HR 制度 RAG 问答系统 — 命令行入口
 运行：python main.py
 流程：加载/构建 FAISS → 构造 RAGEngine → 循环读取用户输入 → 流式打印回答。
 说明：CLI 不落库 MySQL；多轮对话在模型侧仍按「单轮」处理（无历史注入），与 ARCHITECTURE 4.5 一致。
+
+【与 api_server 的差异】二者都构造 `KnowledgeBase` + `RAGEngine`，但 CLI 无 FastAPI lifespan、无 `to_thread`、无 MySQL。
+学习时可先跑通本文件再对照 `api_server._bootstrap_rag_core`。
 """
 import os  # 在 import torch/langchain 之前设置线程环境变量
 import sys  # 标准流重绑定为 UTF-8（Windows 控制台）
@@ -27,7 +30,10 @@ from rag_engine import RAGEngine
 
 
 def main():
-    """交互式主循环：构建或加载向量库，然后持续问答直至用户输入 exit。"""
+    """
+    交互式主循环：构建或加载向量库 → `RAGEngine` → 每轮 `ask`。
+    与 API 差异：无 `to_thread`（主线程直接跑 RAG）、无 MySQL；流式仅 stdout 回调。
+    """
     print("=" * 60)
     print("HR制度RAG问答系统")
     print("=" * 60)
@@ -57,7 +63,7 @@ def main():
             break
 
         print("[AI] ", end="", flush=True)
-        # stream_callback：生成阶段逐 token 写控制台；检索阶段仍在 ask 内同步执行
+        # 流式：仅 LLM 生成阶段回调；前面的检索/重排仍阻塞至首 token 前
         result = engine.ask(
             query,
             stream_callback=lambda t: (sys.stdout.write(t), sys.stdout.flush()),

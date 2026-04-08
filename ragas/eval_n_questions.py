@@ -18,7 +18,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # 项目根目录加入 path，便于导入 config（须在 import ragas 库之前）
 _root = Path(__file__).resolve().parent.parent
@@ -54,7 +54,7 @@ from config import (
     get_ragas_evaluator_llm,
 )
 from knowledge_base import KnowledgeBase
-from rag_engine import RAGEngine
+from rag_engine import RAGEngine, document_context_text_for_eval
 
 # 导入RAGAS
 try:
@@ -110,7 +110,14 @@ def run_rag_on_questions(questions: List[Dict], engine: RAGEngine) -> List[Dict]
             result = engine.ask(question)
             # 有推理前缀时仅用最终答案段做 RAGAS，避免指标被推理文本拉偏
             answer = result.get("answer_only") or result.get("result", "")
-            contexts = [d.page_content for d in result.get("source_documents", [])]
+            contexts = [
+                t
+                for t in (
+                    document_context_text_for_eval(d)
+                    for d in result.get("source_documents", [])
+                )
+                if t
+            ]
 
             results.append({
                 "question": question,
@@ -184,6 +191,26 @@ def run_ragas_evaluation(eval_data: List[Dict]) -> pd.DataFrame:
     return result.to_pandas()
 
 
+def _scalar_metric_value(val) -> Optional[float]:
+    """将 RAGAS 结果单元格转为 float；numpy 标量、nan 与列表首元素均兼容，避免误判为 N/A。"""
+    if val is None:
+        return None
+    if hasattr(val, "__len__") and not isinstance(val, (str, bytes)):
+        try:
+            if len(val) == 0:
+                return None
+            val = val[0]
+        except (TypeError, KeyError):
+            return None
+    num = pd.to_numeric(val, errors="coerce")
+    if pd.isna(num):
+        return None
+    f = float(num)
+    if f != f:
+        return None
+    return f
+
+
 def show_results(df: pd.DataFrame, eval_data: List[Dict], output_file: str):
     """显示评估结果并保存"""
     # 获取分数列
@@ -205,15 +232,11 @@ def show_results(df: pd.DataFrame, eval_data: List[Dict], output_file: str):
         print("-" * 50)
         
         for col in score_cols:
-            score = row[col]
-            # 处理可能的数组类型
-            if hasattr(score, '__len__') and not isinstance(score, str):
-                score = score[0] if len(score) > 0 else None
-            
-            if pd.notna(score) and isinstance(score, (int, float)):
-                filled = int(float(score) * 20)
+            sv = _scalar_metric_value(row[col])
+            if sv is not None:
+                filled = int(sv * 20)
                 bar = "#" * filled + "-" * (20 - filled)
-                print(f"  {col:20s}: {score:.3f} [{bar}]")
+                print(f"  {col:20s}: {sv:.3f} [{bar}]")
             else:
                 print(f"  {col:20s}: N/A")
 
@@ -230,10 +253,9 @@ def show_results(df: pd.DataFrame, eval_data: List[Dict], output_file: str):
             # 转换为数值并计算平均
             values = []
             for val in df[col]:
-                if hasattr(val, '__len__') and not isinstance(val, str):
-                    val = val[0] if len(val) > 0 else None
-                if pd.notna(val) and isinstance(val, (int, float)):
-                    values.append(float(val))
+                sv = _scalar_metric_value(val)
+                if sv is not None:
+                    values.append(sv)
             
             if values:
                 avg = sum(values) / len(values)
@@ -256,10 +278,9 @@ def show_results(df: pd.DataFrame, eval_data: List[Dict], output_file: str):
                 return None
             vals = []
             for val in df[name]:
-                if hasattr(val, "__len__") and not isinstance(val, str):
-                    val = val[0] if len(val) > 0 else None
-                if pd.notna(val) and isinstance(val, (int, float)):
-                    vals.append(float(val))
+                sv = _scalar_metric_value(val)
+                if sv is not None:
+                    vals.append(sv)
             return sum(vals) / len(vals) if vals else None
 
         fm = _column_mean("faithfulness")

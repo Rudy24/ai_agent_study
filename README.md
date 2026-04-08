@@ -68,17 +68,71 @@ python main.py
 
 首次运行会构建知识库索引（FAISS），后续直接从本地加载。
 
+### 上线前检查（延迟 / 拒答 / 引用）
+
+| 项 | 说明 |
+|----|------|
+| **延迟** | 典型一问的端到端时间取决于本机 **GPU（嵌入+Rerank）**、DeepSeek 网络 RTT 与是否流式首包；可在浏览器开发者工具里看 **chat/stream** 从请求到 `t=final` 的耗时，或用秒表粗测 3 个制度问题。已启用 Rerank+GPU 时一般明显快于纯 CPU。 |
+| **知识库外问题** | 对「天气、股票、笑话」等 **明显离题** 问句，服务端会 **短路** 返回礼貌拒答（不调检索/LLM），词表见 `config.RAG_OFF_TOPIC_KEYWORDS`，可用环境变量 `RAG_OFF_TOPIC_KEYWORDS` 追加（逗号分隔）。**人事制度内但文档未写** 的问题仍依赖 Prompt 输出「根据提供的文档，无法找到相关信息」。 |
+| **引用来源** | `POST /api/chat` 与 **SSE `t=final`** 的 JSON 中均含 **`sources`**（`label`、`preview`、可选 **`href`**）。前端已在气泡下展示「参考来源」。若需 **可点击下载/预览链接**，在 `.env` 配置 **`DOCS_PUBLIC_BASE_URL`**（内网文档站点基址，无尾斜杠）；子块 **`metadata.source`** 需在 **重建索引** 后才有完整文件名（见 `knowledge_base` 写入逻辑）。 |
+
+## RAGAS 质量评测
+
+使用 [RAGAS](https://docs.ragas.io/) 对当前 RAG 链路做离线打分：先按测试集跑 `RAGEngine.ask` 得到答案与 `source_documents`，再计算 **context_precision**、**context_recall**、**faithfulness**、**answer_relevancy**（控制台会额外汇总「主指标」：忠实度与答案相关性优先）。
+
+### 环境与依赖
+
+- 在项目根目录、**与线上一致的虚拟环境**下执行（需能 `import config`、加载 FAISS 与 `.env` 中的 `DEEPSEEK_API_KEY`）。
+- `requirements.txt` 已包含 `ragas`、`pandas`、`openpyxl`；若缺包可执行：`pip install -r requirements.txt`。
+
+### 推荐入口（项目根目录）
+
+| 命令 | 说明 |
+|------|------|
+| `python run_eval.py` | 默认评测 **3** 条（内部调用 `ragas/quick_eval.py` → `eval_n_questions.py`） |
+| `python run_eval.py 10` | 评测 10 条 |
+| `python run_eval.py --all` | 评测问题集中的全部条目 |
+| `python ragas/quick_eval.py --help` | 快捷脚本参数（`--input`、`--output`、`--save-dataset` 等） |
+
+等价地也可直接运行：
+
+```bash
+python ragas/eval_n_questions.py --num 5
+python ragas/eval_n_questions.py --all
+python ragas/eval_n_questions.py --num 3 --output my_eval.xlsx --save-dataset
+```
+
+### 测试数据与输出位置
+
+- 默认问题集：`ragas/data/hr_eval_questions.json`（`question` + `ground_truth`）；可通过 `--input` 指定其它 JSON。
+- 结果默认写入 **`ragas/results/`**（相对 `--output` 文件名会解析到该目录）：Excel（`.xlsx`）及同基名的 JSON 摘要。
+
+### 说明与排错
+
+- RAGAS 会多次调用评测用 LLM（与 DeepSeek 配置相关），**耗时长、会产生 API 费用**，建议先用少量 `--num` 试跑。
+- 指标解读、自建数据集格式、调参建议等见 **`ragas/README_EVAL.md`**（含 `generate_eval_dataset.py` / `eval_ragas.py` 等扩展流程）。
+
 ## 项目结构
 
 ```
 my_rag_system/
 ├── .env                      # 环境变量配置（API密钥、设备、模型路径）
 ├── requirements.txt          # Python依赖
+├── run_eval.py               # RAGAS 快捷入口（默认 3 条）
 ├── config.py                 # 全局配置
 ├── knowledge_base.py         # 文档处理与向量库构建
 ├── rag_engine.py             # 检索与问答逻辑
 ├── main.py                   # 启动入口
+├── api_server.py             # FastAPI 服务入口
 ├── download_model.py         # 模型下载脚本
+├── tests/                    # 测试与压测
+│   └── concurrency/          # /api/chat 并发压测（标准库，见 run_concurrent_chat.py）
+├── ragas/                    # RAGAS 评测脚本与数据
+│   ├── data/                 # 评测问题集（如 hr_eval_questions.json）
+│   ├── results/              # 评测输出（Excel/JSON）
+│   ├── eval_n_questions.py   # 主流程：跑 RAG + RAGAS 四指标
+│   ├── quick_eval.py         # 参数转发到 eval_n_questions
+│   └── README_EVAL.md        # 评测扩展说明与指标详解
 ├── models/                   # 本地模型目录（由 download_model.py 创建）
 │   └── bge-small-zh-v1.5/    # 嵌入模型文件
 ├── docs/                     # 静态源文档目录（可用 DOCS_DIR 配置）
