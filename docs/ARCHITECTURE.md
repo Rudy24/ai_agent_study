@@ -4,19 +4,17 @@
 
 ---
 
-## 0. 学习优先级与阅读路线（重点）
-
 下表按「先搞懂主干、再深入细节」排序；标 ★ 为建议精读。
 
-| 优先级 | 文件 / 符号 | 学什么 |
-|--------|-------------|--------|
-| ★★★ | `rag_engine.py` → `RAGEngine.ask` | 一次问答的**完整分支**：离题短路、重排链、压缩链、RetrievalQA、流式回调。 |
-| ★★★ | `rag_engine.py` → `_build_context` / `format_answer_with_reasoning` | **父子块**如何进 Prompt；**推理+最终答案**如何拆分；**concise** 后处理如何约束忠实度。 |
-| ★★ | `knowledge_base.py` → `KnowledgeBase.process_document` | 文档如何切成**父块/子块**、谁写入 FAISS。 |
-| ★★ | `config.py`（前半） | `.env` 如何映射到 `SEARCH_K`、`RERANK_*`、`RAG_LLM_MAX_TOKENS`、`RAG_LOW_LATENCY_MODE` 等。 |
-| ★★ | `api_server.py` → `chat` / `_chat_stream_events` | FastAPI 为何用 **`asyncio.to_thread`** 调同步 `ask`；SSE 如何用**队列+工作线程**把 token 送回协程。 |
-| ★ | `db/chat_store.py`、`db/auth.py` | 会话与消息的落库、`X-API-Key` 如何映射用户。 |
-| ★ | `ragas/*` | 评测如何复用同一套 `config` 与 `RAGEngine`。 |
+| 优先级 | 文件 / 符号　　　　　　　　　　　　　　　　　　　　　　　　　　　　 | 学什么　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　|
+| --------| ---------------------------------------------------------------------| -----------------------------------------------------------------------------------------------------|
+| ★★★　　| `rag_engine.py` → `RAGEngine.ask`　　　　　　　　　　　　　　　　　 | 一次问答的**完整分支**：离题短路、重排链、压缩链、RetrievalQA、流式回调。　　　　　　　　　　　　　 |
+| ★★★　　| `rag_engine.py` → `_build_context` / `format_answer_with_reasoning` | **父子块**如何进 Prompt；**推理+最终答案**如何拆分；**concise** 后处理如何约束忠实度。　　　　　　　|
+| ★★　　 | `knowledge_base.py` → `KnowledgeBase.process_document`　　　　　　　| 文档如何切成**父块/子块**、谁写入 FAISS。　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 |
+| ★★　　 | `config.py`（前半）　　　　　　　　　　　　　　　　　　　　　　　　 | `.env` 如何映射到 `SEARCH_K`、`RERANK_*`、`RAG_LLM_MAX_TOKENS`、`RAG_LOW_LATENCY_MODE` 等。　　　　 |
+| ★★　　 | `api_server.py` → `chat` / `_chat_stream_events`　　　　　　　　　　| FastAPI 为何用 **`asyncio.to_thread`** 调同步 `ask`；SSE 如何用**队列+工作线程**把 token 送回协程。 |
+| ★　　　| `db/chat_store.py`、`db/auth.py`　　　　　　　　　　　　　　　　　　| 会话与消息的落库、`X-API-Key` 如何映射用户。　　　　　　　　　　　　　　　　　　　　　　　　　　　　|
+| ★　　　| `ragas/*`　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 | 评测如何复用同一套 `config` 与 `RAGEngine`。　　　　　　　　　　　　　　　　　　　　　　　　　　　　|
 
 **推荐阅读顺序**：`main.py`（最短闭环）→ `api_server.py` 的 `_lifespan` + `chat` → `rag_engine.py` 的 `ask` → `knowledge_base.py` 的切块 → `config.py` 的 Prompt 与检索参数。
 
@@ -286,6 +284,7 @@ flowchart TD
 - 与主项目共用 **`config`** 与 **`RAGEngine`**（或独立建库脚本如 `rebuild_index.py`）。
 - 使用 **`answer_only`** 等字段做 RAGAS，避免推理前缀干扰部分指标。
 - 入口可为 `run_eval.py` → `ragas/quick_eval.py` 等（以仓库当前脚本为准）。
+- **指标优化过程与调参说明**（faithfulness / answer_relevancy、中文 RAGAS、评测对齐方式）：见同目录 **`METRICS_OPTIMIZATION.md`**。
 
 ---
 
@@ -308,7 +307,7 @@ db/                # MySQL ORM、鉴权、聊天持久化
 main.py            # CLI
 frontend/          # Vue 3
 ragas/             # 评测脚本与数据
-docs/              # 制度源文档（默认）与本架构说明
+docs/              # 制度源文档、ARCHITECTURE、METRICS_OPTIMIZATION（指标优化说明）
 tests/concurrency/ # /api/chat 并发压测脚本（可选）
 ```
 

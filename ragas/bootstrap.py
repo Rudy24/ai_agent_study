@@ -16,7 +16,7 @@ DATA_DIR = RAGAS_DIR / "data"
 RESULTS_DIR = RAGAS_DIR / "results"
 # 自动化流水线等中间产物目录
 OUTPUT_DIR = RAGAS_DIR / "output"
-# 默认 HR 30 问测试集路径
+# 默认 HR 评测问题集路径（当前 data/hr_eval_questions.json 为 50 问）
 DEFAULT_QUESTIONS_JSON = DATA_DIR / "hr_eval_questions.json"
 # 示例评估数据集（仅 RAGAS、不跑 RAG）
 EXAMPLE_DATASET_JSON = DATA_DIR / "eval_dataset_example.json"

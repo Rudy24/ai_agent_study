@@ -80,6 +80,8 @@ python main.py
 
 使用 [RAGAS](https://docs.ragas.io/) 对当前 RAG 链路做离线打分：先按测试集跑 `RAGEngine.ask` 得到答案与 `source_documents`，再计算 **context_precision**、**context_recall**、**faithfulness**、**answer_relevancy**（控制台会额外汇总「主指标」：忠实度与答案相关性优先）。
 
+指标调优思路、评测对齐方式与相关环境变量说明见 **`docs/METRICS_OPTIMIZATION.md`**。
+
 ### 环境与依赖
 
 - 在项目根目录、**与线上一致的虚拟环境**下执行（需能 `import config`、加载 FAISS 与 `.env` 中的 `DEEPSEEK_API_KEY`）。
@@ -104,7 +106,8 @@ python ragas/eval_n_questions.py --num 3 --output my_eval.xlsx --save-dataset
 
 ### 测试数据与输出位置
 
-- 默认问题集：`ragas/data/hr_eval_questions.json`（`question` + `ground_truth`）；可通过 `--input` 指定其它 JSON。
+- 默认问题集：`ragas/data/hr_eval_questions.json`（`question` + `ground_truth`，当前 **50** 条）；可通过 `--input` 指定其它 JSON。
+- 压力/刁钻题集（**10** 条，边界与易混条款）：`ragas/data/hr_eval_questions_adversarial.json`，例：`python ragas/eval_n_questions.py --input ragas/data/hr_eval_questions_adversarial.json --num 10`。
 - 结果默认写入 **`ragas/results/`**（相对 `--output` 文件名会解析到该目录）：Excel（`.xlsx`）及同基名的 JSON 摘要。
 
 ### 说明与排错

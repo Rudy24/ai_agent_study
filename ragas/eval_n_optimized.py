@@ -11,7 +11,7 @@ N条HR问题RAGAS验证脚本（优化版）
 
 参数:
   --num: 测试问题数量（默认5条）
-  --all: 测试全部30条问题
+  --all: 测试全部问题（与 hr_eval_questions.json 条数一致，当前为 50 条）
   --compare: 同时运行原版和优化版进行对比
   --output-dir: 输出目录（默认 ragas/results）
 """

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HR 全量（30 问）RAGAS 评估。
+HR 全量（默认问题集 50 问，见 data/hr_eval_questions.json）RAGAS 评估。
 用法:
   python ragas/eval_hr_30.py
   python ragas/eval_hr_30.py --skip-rag --dataset ragas/results/hr_30_dataset.json
@@ -120,7 +120,7 @@ def run_ragas(eval_data: List[Dict]) -> pd.DataFrame:
 
 def main():
     """入口：可选跳过 RAG 仅评估已保存数据集。"""
-    p = argparse.ArgumentParser(description="HR 30 问 RAGAS")
+    p = argparse.ArgumentParser(description="HR 全量 RAGAS（默认 50 问）")
     p.add_argument("--skip-rag", action="store_true", help="不调用 RAG，直接读数据集 JSON")
     p.add_argument(
         "--dataset",
