@@ -10,7 +10,7 @@
   C) CrossEncoder：`RERANKER_MODEL` → 默认本地目录 `RERANKER_MODEL_PATH`。
   D) 工具：`_env_bool`、`_env_int`（读 .env 整数/布尔并钳位）。
   E) 检索与延迟：`SEARCH_K`、`RERANK_*`、`USE_RERANKER`、`RAG_LOW_LATENCY_MODE`、`RAG_LLM_MAX_TOKENS`。
-  F) 行为开关：`RAG_PROMPT_STYLE`、离题短路 `RAG_OFF_TOPIC_*`、`DOCS_PUBLIC_BASE_URL`。
+  F) 行为开关：`RAG_PROMPT_STYLE`、`RAG_REASONING_MODE`（COT/ReAct）、离题短路 `RAG_OFF_TOPIC_*`、`DOCS_PUBLIC_BASE_URL`。
   G) RAGAS：评测用 LLM、answer_relevancy 等工厂函数（脚本用，非 API 热路径）。
   H) 运行与模板：`API_*`、`FAISS_INDEX_PATH`、种子文档解析、`get_current_prompt_template()`。
 
@@ -140,6 +140,10 @@ if RAG_LOW_LATENCY_MODE:
 _raw_style = os.getenv("RAG_PROMPT_STYLE", "concise").strip().lower()
 RAG_PROMPT_STYLE = _raw_style if _raw_style in ("concise", "standard") else "concise"
 
+# ---------- 推理形态：default / cot / react / cot_react（仅改 Prompt，不增加检索轮次）----------
+_raw_reasoning = os.getenv("RAG_REASONING_MODE", "default").strip().lower()
+_VALID_REASONING_MODES = frozenset({"default", "cot", "react", "cot_react"})
+RAG_REASONING_MODE = _raw_reasoning if _raw_reasoning in _VALID_REASONING_MODES else "default"
 
 # 单句摘录答案时，向检索正文前后各最多扩展若干字（仍为连续原文），纳入与用户问题更易重合的词，利于 RAGAS answer_relevancy；0 关闭
 RAG_RELEVANCY_CONTEXT_EXPAND_MARGIN = _env_int("RAG_RELEVANCY_CONTEXT_EXPAND_MARGIN", 25, 0, 120)
@@ -492,20 +496,62 @@ API_CORS_ORIGINS = [x.strip() for x in _api_cors_raw.split(",") if x.strip()]
 # - 「铁律」约束输出形态与无答案话术，降低胡编与跑题；不能替代网关侧恶意检测。
 # 【与「幻觉」的关系】
 # - 要求先「推理：」再「最终答案：」便于人工与 RAGAS 拆分；最终段仍受 rag_engine 的 concise 后处理约束。
+# - RAG_REASONING_MODE 切换 COT / ReAct 等说明；占位符仍为 {context}、{question}。
 # =============================================================================
 
 # 业务线开关：决定 get_current_prompt_template() 返回哪套模板（现仅 HR 一套）
 RAG_SYSTEM_TYPE = os.getenv("RAG_SYSTEM_TYPE", "hr").strip().lower()
 
-# HR 制度主模板：input_variables 必须为 context、question，与 RAGEngine.optimized_prompt 一致
-HR_PROMPT_TEMPLATE = """你是企业 HR 制度的严格问答机器人。**最终结论只回答用户明确提出的问题**，不要答非所问。
+# ---------- HR Prompt：角色 + 按 RAG_REASONING_MODE 切换推理段 + 共用铁律 ----------
+_HR_PROMPT_ROLE = """你是企业 HR 制度的严格问答机器人。**最终结论只回答用户明确提出的问题**，不要答非所问。
+"""
 
-请先一步步思考并展示你的推理过程（简要说明依据了上下文哪些要点、如何对应到问题），再给出最终答案。
+_HR_REASONING_BLOCK_DEFAULT = """请先一步步思考并展示你的推理过程（简要说明依据了上下文哪些要点、如何对应到问题），再给出最终答案。
 
 【输出格式】（必须严格遵守）
 1）先写一段或多段「推理：」开头的文字（逐步推理，可换行）。
 2）单独起一行，写「最终答案：」五个字加中文冒号；其**后同一行或紧随其后**只写面向用户的简洁结论，不要在该标记之前写结论。
+"""
 
+_HR_REASONING_BLOCK_COT = """请使用链式思考（Chain-of-Thought）。在写出「最终答案：」之前，必须先以「推理：」起首，并在同一段推理区内用编号步骤完整展示思路（每步一行或一句，禁止空洞套话）：
+1）问题拆解：用户真正要问的结论点是什么；
+2）上下文定位：【上下文】中与该点直接相关的条款或关键词（可摘录≤20字原文作锚点）；
+3）条件核对：是否存在适用前提、例外或数字区间；
+4）自检：结论是否仅来自【上下文】字面，无外延臆测。
+
+【输出格式】（必须严格遵守）
+1）推理区整体以「推理：」开头，其内包含上述编号步骤（可略增子步骤，但须保持编号清晰）。
+2）单独起一行写「最终答案：」加中文冒号；其后只写面向用户的简洁结论，不要在该标记之前写结论。
+"""
+
+_HR_REASONING_BLOCK_REACT = """请使用 ReAct 风格：在已给出的【上下文】内进行「思考 → 行动 → 观察」循环（至多 2 轮即可，勿冗长）。禁止编造未出现在【上下文】中的条文或数字；「观察」必须是从【上下文】可逐字支持的要点。
+
+每轮请严格使用下列行首标签（便于阅读）：
+思考：……
+行动：在【上下文】中查找/对照的具体关键词或条款位置说明（可带≤30字引号摘录作为定位锚点）……
+观察：基于【上下文】摘录得到的客观要点（勿在此步骤做最终对用户答复的完整结论文）……
+
+完成至多 2 轮后，用一行「思考：」简要汇总是否足以作答，然后**必须**另起一行写「最终答案：」（五个字加中文冒号）及结论。
+
+【输出格式】（必须严格遵守）
+1）「最终答案：」必须单独成行；其前为 ReAct 循环与最后一行「思考：」汇总。
+2）「最终答案：」之后只写面向用户的简洁结论。
+"""
+
+_HR_REASONING_BLOCK_COT_REACT = """请结合 ReAct 与链式思考（COT）：
+第一阶段（ReAct，至多 2 轮）：每轮包含
+思考：……
+行动：……（仅在【上下文】内检索/对照，可含短引号摘录）
+观察：……（仅客观摘录，不做最终用户口径结论）
+第二阶段（COT）：以「推理：」起首，用编号步骤 1）2）3）4）对应「问题拆解 → 证据归纳 → 条件与例外 → 与【上下文】字面一致性自检」。
+最后单独一行「最终答案：」加中文冒号，其后只写简洁结论。
+
+【输出格式】（必须严格遵守）
+1）顺序固定：ReAct 循环 →「推理：」+ 编号 COT →「最终答案：」。
+2）「最终答案：」之前不得写出面向用户的完整结论文（仅可在「观察」「推理」中写分析性语句）。
+"""
+
+_HR_PROMPT_IRON_AND_SLOTS = """
 【铁律】（仅约束「最终答案：」之后的内容）
 - 最终答案第一句必须直接包含问题的关键词或量词。
 - 若问题中出现业务主题词（如「免费补卡」「负激励」「旷工」等），结论中须保留与上下文一致的同一表述，勿仅用数字或「按规定」等代称带过（仍不得编造上下文中没有的词）。
@@ -521,11 +567,29 @@ HR_PROMPT_TEMPLATE = """你是企业 HR 制度的严格问答机器人。**最�
 {question}"""
 
 
+def _hr_prompt_body_for_reasoning_mode(mode: str) -> str:
+    """按 RAG_REASONING_MODE 选取推理说明段，拼成完整 HR 模板。"""
+    block_map = {
+        "default": _HR_REASONING_BLOCK_DEFAULT,
+        "cot": _HR_REASONING_BLOCK_COT,
+        "react": _HR_REASONING_BLOCK_REACT,
+        "cot_react": _HR_REASONING_BLOCK_COT_REACT,
+    }
+    mid = block_map.get(mode, _HR_REASONING_BLOCK_DEFAULT)
+    return _HR_PROMPT_ROLE + mid + _HR_PROMPT_IRON_AND_SLOTS
+
+
+# 与 RAG_REASONING_MODE=default 时 get_current_prompt_template() 全文一致（便于对照）
+HR_PROMPT_TEMPLATE = _hr_prompt_body_for_reasoning_mode("default")
+
+
 def get_current_prompt_template():
-    """返回当前 RAG_SYSTEM_TYPE 对应的 Prompt 字符串（须含 {context} 与 {question} 占位符）。"""
+    """返回当前 RAG_SYSTEM_TYPE 与 RAG_REASONING_MODE 下的 Prompt（须含 {context} 与 {question}）。"""
     if RAG_SYSTEM_TYPE == "hr":
-        return HR_PROMPT_TEMPLATE
-    return HR_PROMPT_TEMPLATE
+        return _hr_prompt_body_for_reasoning_mode(RAG_REASONING_MODE)
+    return _hr_prompt_body_for_reasoning_mode(RAG_REASONING_MODE)
 
 
-print(f"[INFO] 当前系统类型: {RAG_SYSTEM_TYPE}，Prompt 模板已加载")
+print(
+    f"[INFO] 当前系统类型: {RAG_SYSTEM_TYPE}，推理模式: {RAG_REASONING_MODE}，Prompt 模板已加载"
+)

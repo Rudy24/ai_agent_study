@@ -21,7 +21,7 @@ RAG 引擎模块（rag_engine.py）
 
 【记忆】本模块不读取历史消息；多轮仅由 API/DB 存库，单轮 ask 只消费当前 question。
 
-配置依赖：config 中 DeepSeek、SEARCH_K、RERANK_*、RAG_PROMPT_STYLE、RAG_LLM_MAX_TOKENS、get_current_prompt_template。
+配置依赖：config 中 DeepSeek、SEARCH_K、RERANK_*、RAG_PROMPT_STYLE、RAG_REASONING_MODE、RAG_LLM_MAX_TOKENS、get_current_prompt_template。
 
 【源码分区】文件中用「# ========== … ==========」标题划分：导入 → 离题短路 → concise 后处理 →
 检索辅助函数 → RAGEngine 类（__init__ / 检索 / LLM / ask）。
@@ -81,6 +81,7 @@ from config import (
     RAG_OFF_TOPIC_KEYWORDS,
     RAG_OFF_TOPIC_REPLY,
     RAG_PROMPT_STYLE,
+    RAG_REASONING_MODE,
     RAG_RELEVANCY_CONTEXT_EXPAND_MARGIN,
     RERANK_BATCH_SIZE,
     RERANK_MAX_PASSAGE_CHARS,
@@ -463,7 +464,10 @@ class RAGEngine:
             template=prompt_template_text,
             input_variables=["context", "question"],
         )
-        print(f"[INFO] RAG 生成模版: 系统类型={RAG_SYSTEM_TYPE}, Prompt样式={RAG_PROMPT_STYLE}")
+        print(
+            f"[INFO] RAG 生成模版: 系统类型={RAG_SYSTEM_TYPE}, "
+            f"Prompt样式={RAG_PROMPT_STYLE}, 推理模式={RAG_REASONING_MODE}"
+        )
 
         # 重排就绪则主路径用手写检索+精排，不再用 RetrievalQA 包一层（避免与 rerank 逻辑重复）
         self._cross_encoder = None

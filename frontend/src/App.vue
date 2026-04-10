@@ -279,10 +279,36 @@ watch(
               <span class="thinking">正在检索与生成…</span>
             </template>
             <article v-else class="answer">
-              <span class="answer-reasoning">{{ splitAnswerBold(m.text).before }}</span
-              ><strong v-if="splitAnswerBold(m.text).bold" class="answer-final">{{
-                splitAnswerBold(m.text).bold
-              }}</strong>
+              <template v-for="parts in [splitAnswerBold(m.text)]" :key="`${m.id}-ans`">
+                <section
+                  v-if="parts.before.trim()"
+                  class="reasoning-block"
+                  :class="{ 'reasoning-block--streaming': m.streaming }"
+                  aria-label="思考与推理过程"
+                >
+                  <div class="reasoning-block__head">
+                    <span class="reasoning-block__icon" aria-hidden="true">
+                      <svg viewBox="0 0 20 20" width="16" height="16" fill="none">
+                        <path
+                          d="M10 3v3M10 14v3M3 10h3M14 10h3M5.2 5.2l2.1 2.1M12.7 12.7l2.1 2.1M5.2 14.8l2.1-2.1M12.7 7.3l2.1-2.1"
+                          stroke="currentColor"
+                          stroke-width="1.35"
+                          stroke-linecap="round"
+                        />
+                        <circle cx="10" cy="10" r="2.25" fill="currentColor" />
+                      </svg>
+                    </span>
+                    <span class="reasoning-block__title">思考与推理</span>
+                    <span v-if="m.streaming" class="reasoning-block__badge">生成中</span>
+                  </div>
+                  <div class="reasoning-block__body">
+                    <div class="answer-reasoning">{{ parts.before }}</div>
+                  </div>
+                </section>
+                <div v-if="parts.bold" class="answer-final-wrap">
+                  <strong class="answer-final">{{ parts.bold }}</strong>
+                </div>
+              </template>
             </article>
             <div v-if="m.streaming && m.text" class="streaming-hint">生成中…</div>
             <div v-if="!m.streaming && m.sources?.length" class="sources">
@@ -520,9 +546,99 @@ watch(
   font-size: 0.95rem;
 }
 
+/* ---------- 思考 / 推理（CoT、ReAct）：与最终答案分层 ---------- */
+.reasoning-block {
+  margin: 0 0 16px;
+  border-radius: 12px;
+  border: 1px solid #e6eaf0;
+  background: linear-gradient(180deg, #fbfcfe 0%, #f4f6fa 100%);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  overflow: hidden;
+}
+
+.reasoning-block--streaming {
+  border-color: #c8daf8;
+  box-shadow: 0 0 0 1px rgba(22, 119, 255, 0.12);
+}
+
+.reasoning-block__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  background: rgba(255, 255, 255, 0.72);
+  border-bottom: 1px solid #e9edf3;
+}
+
+.reasoning-block__icon {
+  display: flex;
+  color: #1677ff;
+  opacity: 0.9;
+}
+
+.reasoning-block__title {
+  flex: 1;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: #64708b;
+  text-transform: none;
+}
+
+.reasoning-block__badge {
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: #1677ff;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(22, 119, 255, 0.1);
+  animation: reasoning-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes reasoning-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reasoning-block__badge {
+    animation: none;
+  }
+}
+
+.reasoning-block__body {
+  padding: 12px 14px 14px 14px;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.answer-reasoning {
+  margin: 0;
+  padding: 0 0 0 13px;
+  border-left: 2px solid #b8d4ff;
+  color: #6b7380;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.62;
+  letter-spacing: 0.01em;
+  white-space: pre-wrap;
+}
+
+.answer-final-wrap {
+  margin-top: 2px;
+}
+
 .answer-final {
+  display: block;
   font-weight: 700;
-  color: #0d0d0d;
+  font-size: 0.97rem;
+  line-height: 1.58;
+  color: #111827;
+  letter-spacing: 0.01em;
 }
 
 .input-dock {
