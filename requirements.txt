@@ -17,6 +17,9 @@ ragas
 pandas
 openpyxl
 
+# Agentic RAG（可选，与 RAG_USE_LANGGRAPH 联用）
+langgraph
+
 # HTTP API for frontend
 fastapi
 uvicorn[standard]

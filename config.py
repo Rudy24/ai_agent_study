@@ -10,7 +10,7 @@
   C) CrossEncoder：`RERANKER_MODEL` → 默认本地目录 `RERANKER_MODEL_PATH`。
   D) 工具：`_env_bool`、`_env_int`（读 .env 整数/布尔并钳位）。
   E) 检索与延迟：`SEARCH_K`、`RERANK_*`、`USE_RERANKER`、`RAG_LOW_LATENCY_MODE`、`RAG_LLM_MAX_TOKENS`。
-  F) 行为开关：`RAG_PROMPT_STYLE`、`RAG_REASONING_MODE`（COT/ReAct）、离题短路 `RAG_OFF_TOPIC_*`、`DOCS_PUBLIC_BASE_URL`。
+  F) 行为开关：`RAG_PROMPT_STYLE`、`RAG_REASONING_MODE`（COT/ReAct）、`RAG_USE_LANGGRAPH`（Agentic RAG）、离题短路 `RAG_OFF_TOPIC_*`、`DOCS_PUBLIC_BASE_URL`。
   G) RAGAS：评测用 LLM、answer_relevancy 等工厂函数（脚本用，非 API 热路径）。
   H) 运行与模板：`API_*`、`FAISS_INDEX_PATH`、种子文档解析、`get_current_prompt_template()`。
 
@@ -144,6 +144,11 @@ RAG_PROMPT_STYLE = _raw_style if _raw_style in ("concise", "standard") else "con
 _raw_reasoning = os.getenv("RAG_REASONING_MODE", "default").strip().lower()
 _VALID_REASONING_MODES = frozenset({"default", "cot", "react", "cot_react"})
 RAG_REASONING_MODE = _raw_reasoning if _raw_reasoning in _VALID_REASONING_MODES else "default"
+
+# ---------- Agentic RAG（LangGraph）：检索-质检-改写-再检索循环，关则沿用原 ask 单路径 ----------
+RAG_USE_LANGGRAPH = _env_bool("RAG_USE_LANGGRAPH", False)
+RAG_AGENT_GRADE_ENABLED = _env_bool("RAG_AGENT_GRADE_ENABLED", True)
+RAG_AGENT_MAX_RETRIEVE_ROUNDS = _env_int("RAG_AGENT_MAX_RETRIEVE_ROUNDS", 2, 1, 5)
 
 # 单句摘录答案时，向检索正文前后各最多扩展若干字（仍为连续原文），纳入与用户问题更易重合的词，利于 RAGAS answer_relevancy；0 关闭
 RAG_RELEVANCY_CONTEXT_EXPAND_MARGIN = _env_int("RAG_RELEVANCY_CONTEXT_EXPAND_MARGIN", 25, 0, 120)

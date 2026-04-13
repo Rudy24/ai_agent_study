@@ -406,11 +406,12 @@ class RAGEngine:
     """
     混合检索 + 可选 CrossEncoder 重排 + DeepSeek 生成。
     初始化阶段：建 retriever / ensemble /（可选）qa_chain 与 compression_retriever；
-    运行阶段：入口一律为 ask()。
+    运行阶段：入口为 ask()；若配置开启 LangGraph 则 API 可走 ask_agentic()。
     """
 
     def __init__(self, vectorstore):
         self.vectorstore = vectorstore  # LangChain FAISS 包装，含 embed_query 与 docstore
+        self._agentic_graph = None  # LangGraph 编译实例，首次 ask_agentic 时懒加载
         # LLM：temperature=0 降随机性；max_tokens 须顶层传入（LangChain Pydantic 禁止塞 model_kwargs）
         self.llm = ChatOpenAI(
             model=DEEPSEEK_MODEL,
@@ -658,26 +659,91 @@ class RAGEngine:
             return list(er.invoke(expanded_query) or [])
         return list(er.get_relevant_documents(expanded_query) or [])
 
+    def retrieve_top_documents(self, retrieval_query: str, user_question: str) -> List:
+        """
+        Agentic RAG 专用：用 `retrieval_query` 做向量+BM25 召回，用用户原句 `user_question` 与 CrossEncoder 配对精排。
+        不经过上下文压缩链；无 rerank 时返回 ensemble Top `RERANK_TOP_N`。
+        """
+        if self._reranker_ready:
+            self._ensure_cross_encoder()
+            merged = self._retrieve_for_rerank(retrieval_query)
+            return self._rerank_documents(user_question, merged)
+        docs = self._ensemble_get_documents(retrieval_query)
+        return docs[:RERANK_TOP_N] if docs else []
+
+    def _get_agentic_graph(self):
+        """懒编译 LangGraph，避免未开启 Agentic 模式时依赖 langgraph。"""
+        if self._agentic_graph is None:
+            from agentic_rag.graph_builder import build_agentic_rag_graph
+
+            self._agentic_graph = build_agentic_rag_graph(self)
+            print("[INFO] LangGraph Agentic RAG 图已编译")
+        return self._agentic_graph
+
+    def ask_agentic(
+        self,
+        query: str,
+        stream_callback: Optional[Callable[[str], None]] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> dict:
+        """
+        LangGraph 编排入口：prepare → retrieve →（可选）grade → rewrite 循环 → generate。
+        返回结构与 `ask()` 相同，便于 API 与落库复用。
+        """
+        q = (query or "").strip()
+        if not q:
+            return {"result": "", "answer_only": "", "source_documents": []}
+        if RAG_OFF_TOPIC_ENABLED and _query_matches_off_topic(q):
+            print("[INFO] Agentic 路径命中离题词表，直接拒答")
+            payload = _polite_off_topic_payload()
+            if stream_callback:
+                stream_callback(payload["result"])
+            return payload
+        graph = self._get_agentic_graph()
+        out = graph.invoke(
+            {"question": q},
+            config={
+                "configurable": {
+                    "stream_callback": stream_callback,
+                    "status_callback": status_callback,
+                }
+            },
+        )
+        return out.get("final_payload") or {
+            "result": "",
+            "answer_only": "",
+            "source_documents": [],
+        }
+
     # ---------- RAGEngine / LLM：非流式 invoke 与流式 stream 合一出口 ----------
     def _llm_generate(
-        self, prompt_text: str, stream_callback: Optional[Callable[[str], None]] = None
+        self,
+        prompt_text: str,
+        stream_callback: Optional[Callable[[str], None]] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
         """
         组装单条 `HumanMessage` 调用 DeepSeek（经 LangChain ChatOpenAI）。
         - 无 `stream_callback`：同步 `invoke`，适合 `/api/chat` 线程池路径。
         - 有 `stream_callback`：逐 chunk 解析文本并回调，最后拼接成完整串，供后处理与落库。
+        - `status_callback`：在首 token 前推送阶段文案，减轻 SSE 长时间无 delta 的卡顿感。
         """
         messages = [HumanMessage(content=prompt_text)]
         if stream_callback is None:
             resp = self.llm.invoke(messages)
             return resp.content if hasattr(resp, "content") else str(resp)
+        if status_callback:
+            status_callback("正在生成回答…")
         acc: List[str] = []
         try:
             stream_iter = self.llm.stream(messages)
         except Exception as e:
             print(f"[WARN] LLM stream 失败，回退 invoke: {e}")
             resp = self.llm.invoke(messages)
-            return resp.content if hasattr(resp, "content") else str(resp)
+            txt = resp.content if hasattr(resp, "content") else str(resp)
+            if stream_callback and txt:
+                stream_callback(txt)
+            return txt
         for chunk in stream_iter:
             piece = _extract_stream_chunk_text(chunk)
             if piece:
@@ -690,6 +756,7 @@ class RAGEngine:
         query: str,
         docs: List,
         stream_callback: Optional[Callable[[str], None]] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
     ) -> dict:
         """
         **重排路径与兜底路径的汇合点**：已定稿 `docs` → `_build_context` → `optimized_prompt.format` → `_llm_generate`
@@ -698,17 +765,23 @@ class RAGEngine:
         """
         context = self._build_context(docs)
         prompt_text = self.optimized_prompt.format(context=context, question=query)
-        raw = self._llm_generate(prompt_text, stream_callback)
+        raw = self._llm_generate(prompt_text, stream_callback, status_callback)
         blob = _merged_raw_doc_text(docs)
         use_concise = RAG_PROMPT_STYLE == "concise"
         display, answer_only = format_answer_with_reasoning(raw, query, blob, use_concise)
         return {"result": display, "answer_only": answer_only, "source_documents": docs}
 
-    def ask(self, query, stream_callback: Optional[Callable[[str], None]] = None):
+    def ask(
+        self,
+        query,
+        stream_callback: Optional[Callable[[str], None]] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ):
         """
         单次问答入口（无多轮历史注入）。
         :param query: 当前用户问题（整段进入 Prompt 的【问题】栏；CrossEncoder 也用它与 passage 配对）。
         :param stream_callback: 非 None 时 LLM 使用 stream，并对每个文本片回调（SSE 用）。
+        :param status_callback: 可选阶段提示（如 retrieving），供 SSE `t=status` 推送，减轻流式首包前空白等待感。
         :return: dict：`result`（界面展示，可含推理前缀）、`answer_only`（最终句，供 RAGAS）、`source_documents`（引用列表）。
 
         分支优先级简述：离题短路 →（若启用 rerank）双路召回+CE→`_answer_from_context_docs`；
@@ -727,6 +800,8 @@ class RAGEngine:
         # 步骤 1：轻量查询扩展，提高 BM25/向量对同义词的召回
         expanded_query = self._expand_query(query)
         print(f"[DEBUG] query 扩展完成: {expanded_query[:50]}...")
+        if status_callback:
+            status_callback("正在检索知识库并重排…")
 
         # 步骤 2：启用 Rerank 时优先 CrossEncoder（不先走压缩检索器，避免每条候选一次 LLM、约 10s+ 且精排不生效）
         if self._reranker_ready:
@@ -734,7 +809,9 @@ class RAGEngine:
             self._ensure_cross_encoder()
             merged = self._retrieve_for_rerank(expanded_query)
             top_docs = self._rerank_documents(query, merged)
-            return self._answer_from_context_docs(query, top_docs, stream_callback)
+            return self._answer_from_context_docs(
+                query, top_docs, stream_callback, status_callback
+            )
 
         print("[DEBUG] reranker 未启用")
 
@@ -746,7 +823,7 @@ class RAGEngine:
             if RAG_PROMPT_STYLE == "concise":
                 context = self._build_context(compressed_docs)
                 prompt_text = self.optimized_prompt.format(context=context, question=query)
-                raw = self._llm_generate(prompt_text, stream_callback)
+                raw = self._llm_generate(prompt_text, stream_callback, status_callback)
                 blob = _merged_raw_doc_text(compressed_docs)
                 display, answer_only = format_answer_with_reasoning(raw, query, blob, True)
                 return {
@@ -762,7 +839,7 @@ class RAGEngine:
                     # context 用全部 ensemble 文档；source_documents 只截 RERANK_TOP_N 与列表展示一致
                     context = self._build_context(docs)
                     prompt_text = self.optimized_prompt.format(context=context, question=query)
-                    raw = self._llm_generate(prompt_text, stream_callback)
+                    raw = self._llm_generate(prompt_text, stream_callback, status_callback)
                     blob = _merged_raw_doc_text(ctx_docs)
                     display, answer_only = format_answer_with_reasoning(raw, query, blob, False)
                     return {
@@ -789,7 +866,7 @@ class RAGEngine:
                 ctx_docs = docs[:RERANK_TOP_N] if docs else []
                 context = self._build_context(docs)
                 prompt_text = self.optimized_prompt.format(context=context, question=query)
-                raw = self._llm_generate(prompt_text, stream_callback)
+                raw = self._llm_generate(prompt_text, stream_callback, status_callback)
                 blob = _merged_raw_doc_text(ctx_docs)
                 use_concise = RAG_PROMPT_STYLE == "concise"
                 display, answer_only = format_answer_with_reasoning(raw, query, blob, use_concise)
@@ -816,4 +893,6 @@ class RAGEngine:
         print("[WARN] RAG 路径异常：qa_chain 为空，退回 ensemble 检索截断")
         docs = self._ensemble_get_documents(expanded_query)
         ctx_docs = docs[:RERANK_TOP_N] if docs else []
-        return self._answer_from_context_docs(query, ctx_docs, stream_callback)
+        return self._answer_from_context_docs(
+            query, ctx_docs, stream_callback, status_callback
+        )

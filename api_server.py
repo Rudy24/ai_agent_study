@@ -59,6 +59,7 @@ from config import (  # 统一配置
     DATABASE_ENABLED,
     DOCS_PUBLIC_BASE_URL,
     FAISS_INDEX_PATH,
+    RAG_USE_LANGGRAPH,
     USE_RERANKER,
     get_seed_document_path,
 )
@@ -149,6 +150,9 @@ async def _lifespan(app: FastAPI):
     # 启动时预加载 CrossEncoder，避免首个请求额外多秒冷启动（仅 USE_RERANKER=true 时）
     if USE_RERANKER and _rag_engine is not None:
         await asyncio.to_thread(_rag_engine._ensure_cross_encoder)
+    if RAG_USE_LANGGRAPH and _rag_engine is not None:
+        await asyncio.to_thread(_rag_engine._get_agentic_graph)
+        print("[API] RAG_USE_LANGGRAPH=true，问答走 LangGraph Agentic 路径")
     print("[API] RAG 引擎已就绪")
     yield  # 应用运行中；关闭时清理引用，便于多进程 reload 场景释放句柄
     _rag_engine = None
@@ -265,9 +269,12 @@ async def chat(req: ChatRequest, user_id: int = Depends(_get_user_id_dep)):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-    # 同步 RAG（在线程池执行，避免阻塞事件循环）
+    # 同步 RAG（在线程池执行，避免阻塞事件循环）；可选 LangGraph Agentic 路径
     try:
-        raw = await asyncio.to_thread(_rag_engine.ask, q)
+        if RAG_USE_LANGGRAPH:
+            raw = await asyncio.to_thread(_rag_engine.ask_agentic, q)
+        else:
+            raw = await asyncio.to_thread(_rag_engine.ask, q)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -307,7 +314,7 @@ async def _chat_stream_events(
     流式问答生成器：产出 SSE 字符串帧。
     线程模型：`worker` 线程跑同步 `ask(stream_callback=on_token)`；`on_token` 用 call_soon_threadsafe 把片段塞进 asyncio.Queue；
     主协程 `await aq.get()` 再 `yield`，避免在 worker 里直接操作异步上下文。
-    帧类型：meta（conversation_id）→ 多条 delta → 一条 final（完整 result + sources）。
+    帧类型：meta（conversation_id）→ 可选多条 status（阶段提示）→ 多条 delta → 一条 final（完整 result + sources）。
     """
     if _rag_engine is None:
         yield _sse_data({"t": "error", "d": "RAG engine not ready"})
@@ -337,9 +344,20 @@ async def _chat_stream_events(
         # 从工作线程安全投递到 asyncio 队列
         loop.call_soon_threadsafe(aq.put_nowait, ("delta", t))
 
+    def on_status(s: str) -> None:
+        # 检索/质检/生成前等阶段文案，先于首条 delta 到达，缓解「长时间无输出」观感
+        loop.call_soon_threadsafe(aq.put_nowait, ("status", s))
+
     def worker() -> None:
         try:
-            r = _rag_engine.ask(question, stream_callback=on_token)
+            if RAG_USE_LANGGRAPH:
+                r = _rag_engine.ask_agentic(
+                    question, stream_callback=on_token, status_callback=on_status
+                )
+            else:
+                r = _rag_engine.ask(
+                    question, stream_callback=on_token, status_callback=on_status
+                )
             if DATABASE_ENABLED and user_id and conv_id:
                 from db.chat_store import persist_assistant_answer
                 from db.database import SessionLocal
@@ -365,6 +383,8 @@ async def _chat_stream_events(
         kind, payload = await aq.get()  # 阻塞直到 delta / final / err
         if kind == "delta":
             yield _sse_data({"t": "delta", "d": payload})
+        elif kind == "status":
+            yield _sse_data({"t": "status", "d": payload})
         elif kind == "final":
             r = payload or {}
             yield _sse_data(
@@ -388,14 +408,14 @@ async def _chat_stream_events(
 async def chat_stream(req: ChatRequest, user_id: int = Depends(_get_user_id_dep)):
     """
     流式问答：text/event-stream。
-    t=meta：{conversation_id}；t=delta；t=final（含 conversation_id）；t=error。
+    t=meta：{conversation_id}；t=status 阶段文案；t=delta；t=final（含 conversation_id）；t=error。
     """
     q = req.question.strip()
     return StreamingResponse(
         _chat_stream_events(q, user_id, req.conversation_id),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
