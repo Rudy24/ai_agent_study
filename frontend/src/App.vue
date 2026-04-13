@@ -139,6 +139,10 @@ async function consumeSse(res, assistantId) {
         }
         if (msg.t === "meta" && msg.d?.conversation_id) {
           conversationId.value = msg.d.conversation_id;
+        } else if (msg.t === "status" && msg.d != null) {
+          patchAssistant((m) => {
+            m.statusText = String(msg.d);
+          });
         } else if (msg.t === "delta" && msg.d) {
           patchAssistant((m) => {
             m.text += msg.d;
@@ -151,6 +155,7 @@ async function consumeSse(res, assistantId) {
           patchAssistant((m) => {
             if (d.result != null) m.text = String(d.result);
             m.streaming = false;
+            m.statusText = "";
             if (Array.isArray(d.sources)) m.sources = d.sources;
           });
         } else if (msg.t === "error") {
@@ -188,7 +193,14 @@ async function send() {
   error.value = "";
   const assistantId = uid();
   messages.value.push({ id: uid(), role: "user", text: q });
-  messages.value.push({ id: assistantId, role: "assistant", text: "", streaming: true, sources: [] });
+  messages.value.push({
+    id: assistantId,
+    role: "assistant",
+    text: "",
+    streaming: true,
+    sources: [],
+    statusText: "",
+  });
 
   loading.value = true;
   try {
@@ -276,7 +288,7 @@ watch(
           <template v-if="m.role === 'user'">{{ m.text }}</template>
           <template v-else>
             <template v-if="!m.text && m.streaming">
-              <span class="thinking">正在检索与生成…</span>
+              <span class="thinking">{{ m.statusText || "正在检索与生成…" }}</span>
             </template>
             <article v-else class="answer">
               <template v-for="parts in [splitAnswerBold(m.text)]" :key="`${m.id}-ans`">
@@ -305,6 +317,12 @@ watch(
                     <div class="answer-reasoning">{{ parts.before }}</div>
                   </div>
                 </section>
+                <p
+                  v-if="!m.streaming && parts.bold && !parts.before.trim()"
+                  class="reasoning-missing-hint"
+                >
+                  未检测到「最终答案：」前的推理段；请确认 RAG_REASONING_MODE 与模型是否按模板输出「推理：」等。
+                </p>
                 <div v-if="parts.bold" class="answer-final-wrap">
                   <strong class="answer-final">{{ parts.bold }}</strong>
                 </div>
@@ -626,6 +644,17 @@ watch(
   line-height: 1.62;
   letter-spacing: 0.01em;
   white-space: pre-wrap;
+}
+
+.reasoning-missing-hint {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: #8b92a0;
+  background: #f6f7f9;
+  border-radius: 8px;
+  border: 1px dashed #e0e4ea;
 }
 
 .answer-final-wrap {
