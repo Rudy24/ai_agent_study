@@ -198,6 +198,9 @@ RAG_OFF_TOPIC_REPLY = os.getenv(
 # 内部制度文档对外可访问的基址（无尾斜杠），用于 API 返回的 href；不配则前端只展示文件名与摘要
 DOCS_PUBLIC_BASE_URL = os.getenv("DOCS_PUBLIC_BASE_URL", "").strip().rstrip("/")
 
+# ---------- Word 插图 OCR（建库时把 .docx 内嵌图转为可检索文字）----------
+DOCX_IMAGE_OCR_ENABLED = _env_bool("DOCX_IMAGE_OCR_ENABLED", False)
+
 
 def get_ragas_evaluator_llm():
     """

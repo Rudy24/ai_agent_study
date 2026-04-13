@@ -3,7 +3,7 @@
 ==============================
 【职责】
   - 加载 HuggingFace 中文嵌入（本地优先，否则 Hub）
-  - 读取 PDF / DOCX / TXT，清洗文本
+  - 读取 PDF / DOCX / TXT，清洗文本；可选 DOCX_IMAGE_OCR 将正文插图 OCR 后并入文本再切块
   - **父子切块**（见 ARCHITECTURE 4.3）：子块写入 FAISS，父正文挂在子块 metadata
   - FAISS 的 save_local / load_local
 
@@ -15,6 +15,7 @@
 【数据流】磁盘文件 → Loader → 清洗 → 父切分 → 子切分（子带 parent_content）→ FAISS 仅存子块；
 推理时 rag_engine._build_context 优先用 parent_content 拼进 LLM。
 """
+
 import os
 import re
 
@@ -22,7 +23,9 @@ import config as _bootstrap_config  # noqa: F401 — 先于 langchain 应用 Ope
 
 # LangChain 1.x: 组件分散在多个包中
 try:
-    from langchain_community.embeddings import HuggingFaceEmbeddings  # LangChain 0.2.2+ 推荐
+    from langchain_community.embeddings import (
+        HuggingFaceEmbeddings,
+    )  # LangChain 0.2.2+ 推荐
     from langchain_community.document_loaders import TextLoader, PyPDFLoader
 except ImportError:
     # 旧版兼容 (LangChain 0.1.x)
@@ -41,6 +44,7 @@ except ImportError:
     from langchain.vectorstores import FAISS
 
 from config import (
+    DOCX_IMAGE_OCR_ENABLED,
     EMBEDDING_MODEL_NAME,
     EMBEDDING_DEVICE,
     HF_ENDPOINT,
@@ -57,6 +61,7 @@ def _resolve_embedding_device():
     """
     # 在任何 torch 导入前再次设置环境变量
     import os
+
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -65,15 +70,19 @@ def _resolve_embedding_device():
     if EMBEDDING_DEVICE == "auto":
         try:
             import torch
+
             return "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:
             return "cpu"
     if EMBEDDING_DEVICE == "cuda":
         try:
             import torch
+
             if torch.cuda.is_available():
                 return "cuda"
-            print("[WARN] EMBEDDING_DEVICE=cuda 但 torch.cuda.is_available()=False，回退 cpu（请安装 CUDA 版 PyTorch 与驱动）")
+            print(
+                "[WARN] EMBEDDING_DEVICE=cuda 但 torch.cuda.is_available()=False，回退 cpu（请安装 CUDA 版 PyTorch 与驱动）"
+            )
             return "cpu"
         except ImportError:
             print("[WARN] 未安装 torch，嵌入使用 cpu")
@@ -156,25 +165,50 @@ class KnowledgeBase:
     def process_document(self, file_path):
         """
         加载单文件并切分为 **子块** Document 列表（每个子块 metadata 含父全文）。
-        支持：.pdf（PyPDFLoader）、.docx（Docx2txtLoader）、其他扩展名按 UTF-8 文本（TextLoader）。
+        支持：.pdf（PyPDFLoader）、.docx（Docx2txtLoader 或插图 OCR）、其他扩展名按 UTF-8 文本（TextLoader）。
         返回的列表直接交给 `create_vector_store` 做嵌入与 FAISS 写入。
         """
         print(f"[INFO] 正在处理文档: {file_path}")
 
-        # 按扩展名选择 Loader
+        # 按扩展名选择 Loader（.docx 在开启 OCR 时可能已直接得到 documents，无需再 load）
+        documents = None
         if file_path.endswith(".pdf"):
             loader = PyPDFLoader(file_path)
         elif file_path.endswith(".docx"):
             try:
                 from langchain_community.document_loaders import Docx2txtLoader
-                loader = Docx2txtLoader(file_path)
             except ImportError:
-                print("[ERROR] 缺少 docx 支持，请运行: pip install python-docx")
+                print("[ERROR] 缺少 docx 支持，请运行: pip install docx2txt")
                 raise
+            if DOCX_IMAGE_OCR_ENABLED:
+                try:
+                    from docx_image_text import docx_to_plain_text_with_image_ocr
+
+                    try:
+                        from langchain_core.documents import Document as LCDocument
+                    except ImportError:
+                        from langchain.schema import Document as LCDocument
+
+                    merged = _clean_text(docx_to_plain_text_with_image_ocr(file_path))
+                    if not merged:
+                        merged = " "
+                    abs_src = os.path.abspath(file_path)
+                    documents = [
+                        LCDocument(page_content=merged, metadata={"source": abs_src})
+                    ]
+                    print(
+                        "[INFO] DOCX 已使用插图 OCR 合并文本（DOCX_IMAGE_OCR_ENABLED=true）"
+                    )
+                except Exception as ex:
+                    print(f"[WARN] DOCX 插图 OCR 失败，回退 docx2txt: {ex}")
+                    documents = Docx2txtLoader(file_path).load()
+            else:
+                documents = Docx2txtLoader(file_path).load()
         else:
             loader = TextLoader(file_path, encoding="utf-8")
 
-        documents = loader.load()
+        if documents is None:
+            documents = loader.load()
 
         # 清洗
         documents = _clean_documents(documents)
@@ -188,7 +222,7 @@ class KnowledgeBase:
             separators=["\n\n", "\n", "。", "！", "？"],
             length_function=len,
         )
-        
+
         # 2）子文档切分（偏小，实际入索引）
         child_splitter = RecursiveCharacterTextSplitter(
             chunk_size=300,
@@ -196,7 +230,7 @@ class KnowledgeBase:
             separators=["\n\n", "\n", "。", "！", "？", "；", "，"],
             length_function=len,
         )
-        
+
         parent_docs = parent_splitter.split_documents(documents)
         abs_source = os.path.abspath(file_path)
 
@@ -211,7 +245,9 @@ class KnowledgeBase:
                 child.metadata.setdefault("source", abs_source)
                 child_docs.append(child)
 
-        print(f"[OK] 父子索引策略：{len(parent_docs)} 个父文档，{len(child_docs)} 个子文档")
+        print(
+            f"[OK] 父子索引策略：{len(parent_docs)} 个父文档，{len(child_docs)} 个子文档"
+        )
 
         return child_docs
 

@@ -7,6 +7,9 @@ langchain-huggingface
 faiss-cpu
 pypdf
 docx2txt
+python-docx
+Pillow
+rapidocr-onnxruntime
 python-dotenv
 sentence-transformers
 rank_bm25

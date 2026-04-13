@@ -71,7 +71,9 @@ def persist_assistant_answer(
     用于前端「参考来源」回放与审计，不参与下次 RAG 检索。
     """
     now = datetime.now(timezone.utc)
-    conv = session.query(Conversation).filter(Conversation.id == conversation_id).first()
+    conv = (
+        session.query(Conversation).filter(Conversation.id == conversation_id).first()
+    )
     if conv:
         conv.updated_at = now
     extra: Dict[str, Any] = {
@@ -93,7 +95,9 @@ def persist_assistant_answer(
 # ---------- 读路径：列表与单会话时间序 ----------
 
 
-def list_conversations(session: Session, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+def list_conversations(
+    session: Session, user_id: int, limit: int = 50
+) -> List[Dict[str, Any]]:
     """最近会话列表（摘要）。"""
     rows = (
         session.query(Conversation)
@@ -113,7 +117,9 @@ def list_conversations(session: Session, user_id: int, limit: int = 50) -> List[
     ]
 
 
-def list_messages(session: Session, user_id: int, conversation_id: str) -> List[Dict[str, Any]]:
+def list_messages(
+    session: Session, user_id: int, conversation_id: str
+) -> List[Dict[str, Any]]:
     """单会话消息时间序；校验归属。"""
     conv = (
         session.query(Conversation)
