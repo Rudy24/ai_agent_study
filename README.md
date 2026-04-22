@@ -3,6 +3,7 @@
 基于 LangChain + FAISS + 本地中文向量模型 + DeepSeek API 的检索增强生成（RAG）客服 Demo。
 
 **架构与业务逻辑说明**见：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（含 **Prompt 注入防护、上下文压缩、Chunk 策略、幻觉控制、记忆机制** 等与代码一一对应的说明）。
+**生产级改造路线图**见：[docs/PRODUCTION_ROADMAP.md](docs/PRODUCTION_ROADMAP.md)（按 `P0 / P1 / P2` 分阶段梳理测试、监控、索引治理、多轮能力与安全建设）。
 
 ## 核心机制摘要
 
